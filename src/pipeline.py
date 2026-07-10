@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -83,6 +84,14 @@ NORMALIZATION_SAMPLE_COLUMNS = [
     "raw_component",
     "component_norm",
 ]
+
+
+def report_short_normalizations(stage: str, discarded: list[tuple[object, object]]) -> None:
+    if not discarded:
+        return
+    details = "; ".join(f"{raw!r} -> {normalized!r}" for raw, normalized in discarded)
+    print(f"discarded_short_normalizations[{stage}]: {len(discarded)} ({details})", file=sys.stderr)
+
 
 LONG_COLUMNS = [
     "substance_key",
@@ -293,7 +302,12 @@ def load_rare_substance_keys(
             "is_combo": False,
         }
     )
-    components = components[components["component_norm"].str.len().ge(3)].copy()
+    keep = components["component_norm"].str.len().ge(3)
+    report_short_normalizations(
+        "rare",
+        list(zip(rare.loc[~keep, "Generic Name"], components.loc[~keep, "component_norm"])),
+    )
+    components = components[keep].copy()
     matched = match_components_to_atc(components, atc_l5_lookup)
     if matched.empty:
         return set()
@@ -383,12 +397,15 @@ def load_fda_product_substances(
 
 def explode_fda_components(fda: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
+    discarded: list[tuple[object, object]] = []
     for row in fda.itertuples(index=False):
         component_pairs = []
         for component in split_fda_ingredients(row.ActiveIngredient):
             component_norm = normalize_fda_component(component, row.DrugName)
             if len(component_norm) >= 3:
                 component_pairs.append((component, component_norm))
+            else:
+                discarded.append((component, component_norm))
         normalized_components = [component_norm for _, component_norm in component_pairs]
         is_combo = len(set(normalized_components)) >= 2
 
@@ -404,6 +421,7 @@ def explode_fda_components(fda: pd.DataFrame) -> pd.DataFrame:
                     "component_norm": component_norm,
                 }
             )
+    report_short_normalizations("fda", discarded)
     return pd.DataFrame(rows)
 
 
@@ -443,9 +461,18 @@ def load_hsa_product_substances(
         ["component_id", "product_id", "product_name", "raw_component", "component_norm", "product_atc", "is_combo"]
     ].copy()
     fallback_ids = set(fallback["component_id"])
-    unmatched_no_atc = unmatched[
-        ~unmatched["component_id"].isin(fallback_ids) & unmatched["component_norm"].astype(str).str.len().ge(3)
-    ].copy()
+    unmatched_without_fallback = unmatched[~unmatched["component_id"].isin(fallback_ids)].copy()
+    keep = unmatched_without_fallback["component_norm"].astype(str).str.len().ge(3)
+    report_short_normalizations(
+        "hsa_unmatched",
+        list(
+            zip(
+                unmatched_without_fallback.loc[~keep, "raw_component"],
+                unmatched_without_fallback.loc[~keep, "component_norm"],
+            )
+        ),
+    )
+    unmatched_no_atc = unmatched_without_fallback[keep].copy()
     unmatched_audit = unmatched_no_atc[
         ["component_id", "product_id", "product_name", "raw_component", "component_norm", "product_atc", "is_combo"]
     ].copy()
@@ -481,6 +508,7 @@ def load_hsa_product_substances(
 
 def explode_hsa_components(hsa: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
+    discarded: list[tuple[object, object]] = []
     for row in hsa.itertuples(index=False):
         raw_components = split_hsa_ingredients(row.active_ingredients)
         if not raw_components:
@@ -492,6 +520,8 @@ def explode_hsa_components(hsa: pd.DataFrame) -> pd.DataFrame:
             component_norm = normalize_ingredient(component)
             if component == "" or len(component_norm) >= 3:
                 component_pairs.append((component, component_norm))
+            else:
+                discarded.append((component, component_norm))
         normalized_components = [component_norm for _, component_norm in component_pairs]
         non_empty_norms = [value for value in normalized_components if value]
         is_combo = len(set(non_empty_norms)) >= 2
@@ -509,6 +539,7 @@ def explode_hsa_components(hsa: pd.DataFrame) -> pd.DataFrame:
                     "product_atc": row.hsa_ATC,
                 }
             )
+    report_short_normalizations("hsa", discarded)
     return pd.DataFrame(rows)
 
 

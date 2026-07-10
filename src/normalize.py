@@ -565,11 +565,11 @@ _MULTI_WORD_FORM_RE = re.compile(
     re.I,
 )
 _PUNCT_TRANSLATION = str.maketrans({char: " " for char in string.punctuation})
-_EQUIVALENCE_TARGET_RE = re.compile(
+_EQUIVALENCE_MARKER_RE = re.compile(
     r"\b("
-    r"eq\.?\s*to|eqvivalent|eqvt\.?|eqv\.?|equv\.?|equiv(?:alent)?|"
-    r"equivalent|equ\.?\s*to|correspond(?:s|ing)?\s+to"
-    r")\s*(?:to\s+)?(.+)$",
+    r"eq\.?\s+to|eqvivalent|eqvt\.?|eqv\.?|equv\.?|equiv(?:alent)?|"
+    r"equivalent|equ\.?\s+to|eq\.?|correspond(?:s|ing)?\s+to"
+    r")(?:\s+to)?\b",
     re.I,
 )
 _ISOTOPE_RE = re.compile(
@@ -578,6 +578,45 @@ _ISOTOPE_RE = re.compile(
 )
 _REVERSE_ISOTOPE_RE = re.compile(
     r"\b(\d{1,3}m?)(?!\s*%)\s*-?\s*(tc|i|f|ga|cu|lu|y|in|sm|tl|c|n|o|rb|zr|zn|ra|sr|p|cr|fe)\b",
+    re.I,
+)
+_MINERAL_CATION_TERMS = {
+    "aluminum",
+    "barium",
+    "calcium",
+    "cupric",
+    "cuprous",
+    "ferric",
+    "ferrous",
+    "lithium",
+    "magnesium",
+    "manganese",
+    "manganous",
+    "potassium",
+    "sodium",
+    "zinc",
+}
+_MINERAL_ANION_TERMS = {
+    "acetate",
+    "bicarbonate",
+    "carbonate",
+    "chloride",
+    "citrate",
+    "fluoride",
+    "fumarate",
+    "gluconate",
+    "iodide",
+    "lactate",
+    "nitrate",
+    "phosphate",
+    "sulfate",
+}
+_FDA_COMMA_QUALIFIER_RE = re.compile(
+    r",\s*("
+    r"c-14|fe-59|kr-81m|nf|usp|chorionic|conjugated(?:\s+synthetic\s+[ab])?|"
+    r"esterified|glacial|(?:ultra)?microcrystalline|(?:ultra)?microsize|"
+    r"macrocrystalline|dibasic|monobasic|anhydrous|heptahydrate|monohydrate"
+    r")\b",
     re.I,
 )
 _INORGANIC_ACTIVE_RE = re.compile(
@@ -661,8 +700,13 @@ def normalize_ingredient(value: object) -> str:
         text = ""
     original_text = text
 
-    if _ISOTOPE_RE.search(text) or _REVERSE_ISOTOPE_RE.search(text):
+    if _has_isotope_marker(text):
         return _normalize_radiopharma(text)
+
+    if re.fullmatch(r"\s*h\s*2\s*o\s*", text, re.I):
+        return "h2o"
+
+    text = re.sub(r"\b\d*(?:\.\d+)?\s*h2o\b", " ", text, flags=re.I)
 
     # greek letters as escapes so this stays encoding-stable
     text = text.replace("\u03b1", "alpha ")
@@ -671,6 +715,7 @@ def normalize_ingredient(value: object) -> str:
     text = text.replace("\u03b4", "delta ")
     text = re.sub("\u03bc|\u00b5", "u", text)
     text = text.lower()
+    text, serotypes = _protect_serotypes(text)
 
     # split letter/digit boundaries so the \b salt and unit rules can match
     text = re.sub(r"(?<=[a-z])(\d)", r" \1", text)
@@ -706,6 +751,7 @@ def normalize_ingredient(value: object) -> str:
     text = re.sub(r"\bsulphide\b", "sulfide", text)
 
     # multi-word salt phrases before single-word ones, else we half-erase an inn
+    pre_strip_text = text
     text = _MULTI_WORD_FORM_RE.sub(" ", text)
     text = _SALT_STRIP_RE.sub(" ", text)
     text = _DOSE_FORM_RE.sub(" ", text)
@@ -726,6 +772,13 @@ def normalize_ingredient(value: object) -> str:
             unique_tokens.append(token)
     inorganic = _normalize_inorganic_active(original_text)
     normalized = " ".join(unique_tokens)
+    normalized = _restore_serotypes(normalized, serotypes)
+    pre_strip_normalized = _DOSE_FORM_RE.sub(" ", pre_strip_text)
+    pre_strip_normalized = _basic_preserve_normalize(pre_strip_normalized)
+    pre_strip_normalized = _restore_serotypes(pre_strip_normalized, serotypes)
+    mineral_salt = _normalize_mineral_salt(pre_strip_normalized)
+    if mineral_salt and (not normalized or set(normalized.split()).issubset(_MINERAL_CATION_TERMS)):
+        return mineral_salt
     if inorganic and (
         normalized
         in {
@@ -748,6 +801,19 @@ def normalize_ingredient(value: object) -> str:
     if inorganic:
         return inorganic
 
+    if original_text.strip():
+        if re.search(
+            r"\b(?:incl|with|without)\b.*\b(?:combinations?|agents?|salts?)\b|"
+            r"\bsalts?\s+in\s+combinations?\b",
+            original_text,
+            re.I,
+        ):
+            return _basic_preserve_normalize(original_text)
+        return (
+            pre_strip_normalized
+            or _basic_preserve_normalize(original_text)
+            or _squish(original_text.lower())
+        )
     return ""
 
 
@@ -811,11 +877,9 @@ def split_fda_ingredients(value: object) -> list[str]:
     if text.upper().strip() in known_space_delimited:
         return known_space_delimited[text.upper().strip()]
 
-    if ";" in text:
-        return _split_and_squish(text, r";\s*|\s+AND\s+")
-    if "," in text and re.search(r"\band\b", text, re.I):
-        return _split_and_squish(text, r",\s*|\s+and\s+")
-    return _split_and_squish(text, r"\s+AND\s+")
+    protected = _FDA_COMMA_QUALIFIER_RE.sub(lambda match: f"__FDA_COMMA__ {match.group(1)}", text)
+    parts = _split_and_squish(protected, r";\s*|,\s*(?:and\s+)?|\s+and\s+")
+    return [part.replace("__FDA_COMMA__", ",").strip() for part in parts]
 
 
 def split_hsa_ingredients(value: object) -> list[str]:
@@ -863,7 +927,7 @@ def _fix_one_atc(value: object) -> str | None:
 
 
 def _split_and_squish(value: str, pattern: str) -> list[str]:
-    return [part for part in (_squish(part) for part in re.split(pattern, value)) if part]
+    return [part for part in (_squish(part) for part in re.split(pattern, value, flags=re.I)) if part]
 
 
 def _squish(value: str) -> str:
@@ -881,6 +945,18 @@ def _normalize_inorganic_active(value: str) -> str:
             return "phenol"
         return ""
     return _basic_preserve_normalize(match.group(1))
+
+
+def _normalize_mineral_salt(value: str) -> str:
+    tokens = value.split()
+    if not any(token in _MINERAL_CATION_TERMS for token in tokens):
+        return ""
+    if not any(token in _MINERAL_ANION_TERMS for token in tokens):
+        return ""
+    kept = [
+        token for token in tokens if token in _MINERAL_CATION_TERMS or token in _MINERAL_ANION_TERMS
+    ]
+    return " ".join(dict.fromkeys(kept))
 
 
 def _strip_biosimilar_suffixes(value: str) -> str:
@@ -903,12 +979,42 @@ def _strip_biosimilar_suffixes(value: str) -> str:
 
 
 def _prefer_equivalence_target(value: str) -> str:
-    match = _EQUIVALENCE_TARGET_RE.search(value)
+    match = _EQUIVALENCE_MARKER_RE.search(value)
     if not match:
         return value
-    target = match.group(2).strip()
-    if re.search(r"[a-z]", target, re.I):
+    target = value[match.end() :].strip()
+    target = re.sub(r"\s*\([^)]*\)\s*$", "", target).strip(" \t()[]")
+    target_tokens = set(re.findall(r"[a-z]+", target, re.I))
+    noise_tokens = set(SALT_STRIP_TERMS) | set(DOSE_FORM_TERMS) | {"acid"}
+    if target_tokens and not target_tokens.issubset(noise_tokens):
         return target
+    return value[: match.start()]
+
+
+def _has_isotope_marker(value: str) -> bool:
+    if _ISOTOPE_RE.search(value):
+        return True
+    for match in _REVERSE_ISOTOPE_RE.finditer(value):
+        if not re.search(r"(?:sero)?type\s*$", value[: match.start()], re.I):
+            return True
+    return False
+
+
+def _protect_serotypes(value: str) -> tuple[str, dict[str, str]]:
+    serotypes: dict[str, str] = {}
+
+    def replacement(match: re.Match[str]) -> str:
+        marker = f"serotypemarker{string.ascii_lowercase[len(serotypes)]}"
+        serotypes[marker] = match.group(2).lower()
+        return f"{match.group(1)} {marker}"
+
+    text = re.sub(r"\b((?:sero)?type)\s+(\d{1,2}[a-z])\b", replacement, value, flags=re.I)
+    return text, serotypes
+
+
+def _restore_serotypes(value: str, serotypes: dict[str, str]) -> str:
+    for marker, serotype in serotypes.items():
+        value = value.replace(marker, serotype)
     return value
 
 
