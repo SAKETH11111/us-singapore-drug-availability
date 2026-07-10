@@ -454,6 +454,7 @@ SYNONYM_REPLACEMENTS = (
     (r"\bpantothenate\b", "pantothenic acid"),
     (r"\bcoal\s+tar\s+prepared\b", "coal tar"),
     # ocr / typos
+    (r"\bpoliovirius\b", "poliovirus"),
     (r"\bhci\b", "hcl"),
     (r"\bhbri\b", "hbr"),
     (r"\bchlorhidate\b", "chlorhydrate"),
@@ -761,6 +762,8 @@ def normalize_ingredient(value: object) -> str:
     text = text.translate(_PUNCT_TRANSLATION)
     text = re.sub(r"\d+", " ", text)
     text = _squish(text)
+    # "fimbriae type 2 and 3" loses the 3 to the digit strip, leaving a dangling and
+    text = re.sub(r"^(?:and|of)\s+|\s+(?:and|of)$", "", text)
 
     # collapse "drug drug" -> "drug", keeping first-seen order
     tokens = text.split()
@@ -1003,12 +1006,22 @@ def _has_isotope_marker(value: str) -> bool:
 def _protect_serotypes(value: str) -> tuple[str, dict[str, str]]:
     serotypes: dict[str, str] = {}
 
+    def marker_suffix(index: int) -> str:
+        # base-26 letters: markers must survive the digit strip, so no digits
+        suffix = ""
+        index += 1
+        while index:
+            index, remainder = divmod(index - 1, 26)
+            suffix = string.ascii_lowercase[remainder] + suffix
+        return suffix
+
     def replacement(match: re.Match[str]) -> str:
-        marker = f"serotypemarker{string.ascii_lowercase[len(serotypes)]}"
+        marker = f"serotypemarker{marker_suffix(len(serotypes))}"
         serotypes[marker] = match.group(2).lower()
         return f"{match.group(1)} {marker}"
 
-    text = re.sub(r"\b((?:sero)?type)\s+(\d{1,2}[a-z])\b", replacement, value, flags=re.I)
+    # the trailing letter is optional: poliovirus type 1, pneumococcal serotype 14
+    text = re.sub(r"\b((?:sero)?type)\s+(\d{1,2}[a-z]?)\b", replacement, value, flags=re.I)
     return text, serotypes
 
 

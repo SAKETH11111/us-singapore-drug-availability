@@ -65,6 +65,29 @@ class NormalizeIngredientTests(unittest.TestCase):
         )
         self.assertEqual(normalize_ingredient("H2O"), "h2o")
 
+    def test_numeric_only_serotypes_stay_distinct(self):
+        # digit-only serotypes have no trailing letter, so they used to collapse
+        self.assertEqual(
+            normalize_ingredient("Pneumococcal Polysaccharide Serotype 1"),
+            "pneumococcal polysaccharide serotype 1",
+        )
+        self.assertNotEqual(
+            normalize_ingredient("Pneumococcal Polysaccharide Serotype 1"),
+            normalize_ingredient("Pneumococcal Polysaccharide Serotype 3"),
+        )
+        self.assertNotEqual(
+            normalize_ingredient("Poliovirus Type 1"),
+            normalize_ingredient("Poliovirus Type 2"),
+        )
+        self.assertNotEqual(
+            normalize_ingredient("Human Papillomavirus Type 16 L1 Protein"),
+            normalize_ingredient("Human Papillomavirus Type 18 L1 Protein"),
+        )
+        self.assertNotEqual(
+            normalize_ingredient("CYD Dengue Virus Serotype 1"),
+            normalize_ingredient("CYD Dengue Virus Serotype 4"),
+        )
+
     def test_synonyms_salts_and_protected_inns_match_reference_rules(self):
         self.assertEqual(normalize_ingredient("Acetaminophen"), "paracetamol")
         self.assertEqual(normalize_ingredient("ALBUTEROL SULFATE INHALER"), "salbutamol")
