@@ -3,6 +3,12 @@ __pycache__/
 .DS_Store
 .venv/
 data/raw/
+data/.atlas.publish.lock
+data/.atlas-builds/
+data/atlas
+data/**/atlas.sqlite
+data/**/tables/*.csv
+data/**/views/*.csv
 data/output/*
 !data/output/fda_hsa_by_actives.csv
 !data/output/fda_hsa_combo_formulation_gaps.csv
