@@ -26,6 +26,68 @@ from src.pipeline import (
 
 
 class NormalizeIngredientTests(unittest.TestCase):
+    def test_inorganic_salts_survive_salt_stripping(self):
+        self.assertEqual(normalize_ingredient("LITHIUM CARBONATE"), "lithium carbonate")
+        self.assertEqual(normalize_ingredient("FERROUS SULFATE"), "ferrous sulfate")
+
+    def test_equivalence_tails_do_not_replace_the_active_moiety(self):
+        self.assertEqual(
+            normalize_ingredient("AMOXICILLIN TRIHYDRATE EQV (AMOXICILLIN FREE ACID)"),
+            "amoxicillin",
+        )
+        self.assertEqual(
+            normalize_ingredient("DULOXETINE HYDROCHLORIDE (EQUIVALENT TO BASE)"),
+            "duloxetine",
+        )
+        self.assertEqual(
+            normalize_ingredient("(Blue Tablet) ESTRADIOL HEMIHYDRATE 2.07mg equivalent to"),
+            "estradiol",
+        )
+
+    def test_fda_comma_lists_split_without_splitting_name_qualifiers(self):
+        self.assertEqual(
+            split_fda_ingredients("LAMIVUDINE, NEVIRAPINE, AND STAVUDINE"),
+            ["LAMIVUDINE", "NEVIRAPINE", "STAVUDINE"],
+        )
+        self.assertEqual(
+            split_fda_ingredients("EMTRICITABINE, TENOFOVIR ALAFENAMIDE"),
+            ["EMTRICITABINE", "TENOFOVIR ALAFENAMIDE"],
+        )
+        self.assertEqual(
+            split_fda_ingredients("GONADOTROPIN, CHORIONIC"),
+            ["GONADOTROPIN, CHORIONIC"],
+        )
+
+    def test_serotypes_and_water_are_not_routed_as_isotopes(self):
+        self.assertEqual(
+            normalize_ingredient("Streptococcus pneumoniae type 18C"),
+            "streptococcus pneumoniae type 18c",
+        )
+        self.assertEqual(normalize_ingredient("H2O"), "h2o")
+
+    def test_numeric_only_serotypes_stay_distinct(self):
+        # digit-only serotypes have no trailing letter, so they used to collapse
+        self.assertEqual(
+            normalize_ingredient("Pneumococcal Polysaccharide Serotype 1"),
+            "pneumococcal polysaccharide serotype 1",
+        )
+        self.assertNotEqual(
+            normalize_ingredient("Pneumococcal Polysaccharide Serotype 1"),
+            normalize_ingredient("Pneumococcal Polysaccharide Serotype 3"),
+        )
+        self.assertNotEqual(
+            normalize_ingredient("Poliovirus Type 1"),
+            normalize_ingredient("Poliovirus Type 2"),
+        )
+        self.assertNotEqual(
+            normalize_ingredient("Human Papillomavirus Type 16 L1 Protein"),
+            normalize_ingredient("Human Papillomavirus Type 18 L1 Protein"),
+        )
+        self.assertNotEqual(
+            normalize_ingredient("CYD Dengue Virus Serotype 1"),
+            normalize_ingredient("CYD Dengue Virus Serotype 4"),
+        )
+
     def test_synonyms_salts_and_protected_inns_match_reference_rules(self):
         self.assertEqual(normalize_ingredient("Acetaminophen"), "paracetamol")
         self.assertEqual(normalize_ingredient("ALBUTEROL SULFATE INHALER"), "salbutamol")
