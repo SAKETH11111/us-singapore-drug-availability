@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
+
 
 FDA_URL = "https://www.fda.gov/media/89850/download"
 HSA_RESOURCE_ID = "d_767279312753558cbf19d48344577084"
@@ -41,6 +43,8 @@ BT_ACTIONS_URL = (
     "1DWvVvz3PgzGWyMaou-Ckw1Y4RKXBQRAVgjA9lC0INxk/export?format=csv&gid=0"
 )
 EEML_URL = "https://list.essentialmeds.org/print?format=xlsx"
+ATC_INDEX_URL = "https://atcddd.fhi.no/atc_ddd_index/"
+FDA_RARE_URL = "https://www.accessdata.fda.gov/scripts/opdlisting/oopd/"
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,8 @@ def fetch_sources(
     root: Path,
     extraction_date: date,
     countries: tuple[str, ...] = ("US", "SG", "BD", "BT"),
+    atc_path: Path | None = None,
+    rare_drugs_path: Path | None = None,
 ) -> FetchArtifact:
     """Fetch selected country registers plus the required electronic EML.
 
@@ -65,6 +71,21 @@ def fetch_sources(
     root = Path(root).resolve()
     raw = root / "data" / "raw"
     raw.mkdir(parents=True, exist_ok=True)
+    atc_input = Path(atc_path or raw / "who" / "atc.csv").resolve()
+    rare_drugs_input = Path(rare_drugs_path or raw / "Rare Drugs.xls").resolve()
+    missing_reference_inputs = []
+    if not atc_input.is_file():
+        missing_reference_inputs.append(f"ATC ({atc_input})")
+    if not rare_drugs_input.is_file():
+        missing_reference_inputs.append(f"Rare Drugs ({rare_drugs_input})")
+    if missing_reference_inputs:
+        raise FileNotFoundError(
+            "Required legacy reference inputs are missing before fetch: "
+            + ", ".join(missing_reference_inputs)
+            + ". Supply --atc-path and --rare-drugs-path; redistribution rights for the "
+            "ATC bulk file require project-owner review."
+        )
+    _validate_legacy_reference_inputs(atc_input, rare_drugs_input)
     selected = tuple(dict.fromkeys(code.upper() for code in countries))
     unknown = sorted(set(selected) - {"US", "SG", "BD", "BT"})
     if unknown:
@@ -82,6 +103,25 @@ def fetch_sources(
     try:
         records: dict[str, dict[str, object]] = {}
         staged_artifacts: dict[str, Path] = {}
+        staged_atc = staging / "who" / "atc.csv"
+        staged_rare = staging / "Rare Drugs.xls"
+        _write_bytes_atomic(staged_atc, atc_input.read_bytes())
+        _write_bytes_atomic(staged_rare, rare_drugs_input.read_bytes())
+        records["WHO_ATC"] = {
+            "source_url": ATC_INDEX_URL,
+            "sha256": _file_sha256(staged_atc),
+            "license_name": "WHO ATC/DDD Index terms",
+            "license_url": "https://atcddd.fhi.no/copyright_disclaimer/",
+            "license_status": "human_review_required",
+        }
+        records["FDA_RARE"] = {
+            "source_url": FDA_RARE_URL,
+            "sha256": _file_sha256(staged_rare),
+            "license_name": "U.S. FDA public source",
+            "license_url": FDA_RARE_URL,
+            "license_status": "reviewed_public_government_source",
+        }
+        staged_artifacts.update({"WHO_ATC": staged_atc, "FDA_RARE": staged_rare})
         if "US" in selected:
             staged_artifacts.update(_fetch_fda(staging / "fda", extraction_date, records))
         if "SG" in selected:
@@ -117,6 +157,38 @@ def fetch_sources(
         for name, path in staged_artifacts.items()
     }
     return FetchArtifact(extraction_date, published / "manifest.json", artifacts)
+
+
+def _validate_legacy_reference_inputs(atc_path: Path, rare_drugs_path: Path) -> None:
+    """Reject unreadable compatibility inputs before any regulator request."""
+
+    try:
+        atc = pd.read_csv(atc_path, dtype=str)
+    except Exception as exc:
+        raise ValueError(f"ATC reference input is not a readable CSV: {atc_path}") from exc
+    required_atc_columns = {"atc_code", "atc_name"}
+    if not required_atc_columns.issubset(atc.columns) or atc.empty:
+        raise ValueError(
+            "ATC reference input must contain non-empty atc_code and atc_name columns: "
+            f"{atc_path}"
+        )
+    usable_atc_rows = atc["atc_code"].fillna("").astype(str).str.strip().ne("") & atc[
+        "atc_name"
+    ].fillna("").astype(str).str.strip().ne("")
+    if not usable_atc_rows.any():
+        raise ValueError(f"ATC reference input contains no usable rows: {atc_path}")
+
+    try:
+        tables = pd.read_html(rare_drugs_path, encoding="cp1252")
+    except Exception as exc:
+        raise ValueError(
+            f"Rare Drugs reference input is not a readable table: {rare_drugs_path}"
+        ) from exc
+    if not tables or "Generic Name" not in tables[0].columns or tables[0].empty:
+        raise ValueError(
+            "Rare Drugs reference input must contain a non-empty Generic Name column: "
+            f"{rare_drugs_path}"
+        )
 
 
 def _fetch_fda(
@@ -462,8 +534,24 @@ def main() -> None:
         default=["US", "SG", "BD", "BT"],
         choices=["US", "SG", "BD", "BT"],
     )
+    parser.add_argument(
+        "--atc-path",
+        type=Path,
+        help="required local WHO ATC CSV; defaults to data/raw/who/atc.csv",
+    )
+    parser.add_argument(
+        "--rare-drugs-path",
+        type=Path,
+        help="required local FDA Rare Drugs export; defaults to data/raw/Rare Drugs.xls",
+    )
     args = parser.parse_args()
-    artifact = fetch_sources(args.root, args.extraction_date, tuple(args.countries))
+    artifact = fetch_sources(
+        args.root,
+        args.extraction_date,
+        tuple(args.countries),
+        atc_path=args.atc_path,
+        rare_drugs_path=args.rare_drugs_path,
+    )
     print(f"manifest: {artifact.manifest_path}")
     for name, path in sorted(artifact.artifacts.items()):
         print(f"{name}: {path}")

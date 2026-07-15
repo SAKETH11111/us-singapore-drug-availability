@@ -24,6 +24,8 @@ from src.pipeline import (
     parse_who_eml_terms,
 )
 
+ATC_REGRESSION_SUBSET = Path(__file__).parent / "fixtures" / "atc_regression_subset.csv"
+
 
 class NormalizeIngredientTests(unittest.TestCase):
     def test_inorganic_salts_survive_salt_stripping(self):
@@ -388,7 +390,7 @@ class NormalizeIngredientTests(unittest.TestCase):
         self.assertEqual(normalize_ingredient("PHENOL"), "phenol")
 
     def test_required_long_tail_components_match_local_who_l5_entries(self):
-        atc = load_atc(Path(__file__).resolve().parents[1] / "data" / "raw" / "who" / "atc.csv")
+        atc = load_atc(ATC_REGRESSION_SUBSET)
         lookup = build_atc_l5_lookup(atc)
         raw_components = {
             "epoetin alfa": "EPOETIN ALFA",
@@ -438,7 +440,7 @@ class NormalizeIngredientTests(unittest.TestCase):
         self.assertEqual(by_component["urea c 13"], {"V04CX05"})
 
     def test_atc_metadata_aliases_do_not_collapse_identity_keys(self):
-        atc = load_atc(Path(__file__).resolve().parents[1] / "data" / "raw" / "who" / "atc.csv")
+        atc = load_atc(ATC_REGRESSION_SUBSET)
         lookup = build_atc_l5_lookup(atc)
         raw_components = {
             "activated charcoal": "CARBON ACTIVATED",
@@ -521,7 +523,7 @@ class NormalizeIngredientTests(unittest.TestCase):
         self.assertEqual(by_product["FOLLISTIM AQ"], "follitropin beta")
 
     def test_combo_only_components_without_standalone_who_l5_stay_unmatched(self):
-        atc = load_atc(Path(__file__).resolve().parents[1] / "data" / "raw" / "who" / "atc.csv")
+        atc = load_atc(ATC_REGRESSION_SUBSET)
         lookup = build_atc_l5_lookup(atc)
         combo_only = [
             "CARBIDOPA",

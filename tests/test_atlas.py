@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 import sqlite3
 import unittest
 from unittest import mock
@@ -26,6 +28,9 @@ from src.fetch_sources import fetch_sources
 
 
 EXTRACTION_DATE = date(2026, 7, 15)
+REAL_SOURCE_REGRESSIONS = (
+    Path(__file__).parent / "fixtures" / "real_source_regressions.json"
+)
 
 
 def BuildSpec(*args, **kwargs):
@@ -43,6 +48,23 @@ def write_tsv(path: Path, rows: list[dict[str, object]]) -> None:
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def write_legacy_reference_inputs(root: Path) -> None:
+    raw = root / "data" / "raw"
+    write_csv(
+        raw / "who" / "atc.csv",
+        [
+            {"atc_code": "J01CA04", "atc_name": "amoxicillin"},
+            {"atc_code": "N02BE01", "atc_name": "paracetamol"},
+            {"atc_code": "L04AB04", "atc_name": "adalimumab"},
+        ],
+    )
+    (raw / "Rare Drugs.xls").write_text(
+        "<table><tr><th>Generic Name</th></tr>"
+        "<tr><td>unmatched fixture rare medicine</td></tr></table>",
+        encoding="utf-8",
+    )
 
 
 def write_fixture_sources(root: Path) -> None:
@@ -328,9 +350,88 @@ def write_fixture_sources(root: Path) -> None:
             },
         ],
     )
+    write_legacy_reference_inputs(root)
 
 
 class CountryAdapterContractTests(unittest.TestCase):
+    def test_real_south_asia_records_emit_only_declared_active_components(self):
+        cases = json.loads(REAL_SOURCE_REGRESSIONS.read_text(encoding="utf-8"))[
+            "parser_cases"
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            raw = root / "data" / "raw"
+
+            bd_cases = [item for item in cases if item["country_code"] == "BD"]
+            bd_payload = {
+                "metadata": {
+                    "country_code": "BD",
+                    "num_found": len(bd_cases),
+                    "num_returned": len(bd_cases),
+                    "source_url": "frozen real-source regression slice",
+                },
+                "concepts": [
+                    {
+                        "id": case["source_product_key"],
+                        "display_name": case["product_name"],
+                        "retired": False,
+                        "extras": {
+                            "dar_number": case["source_product_key"].split("--", 1)[0],
+                            "trade_name": case["product_name"],
+                            "generic_content_raw": case["raw_ingredient_text"],
+                            "dosage_form": "source slice",
+                            "company": "source slice",
+                            "dar_quality_flag": "",
+                        },
+                    }
+                    for case in bd_cases
+                ],
+            }
+            bd_path = raw / "bd" / "dgda_concepts.json"
+            bd_path.write_text(json.dumps(bd_payload), encoding="utf-8")
+
+            bt_cases = [item for item in cases if item["country_code"] == "BT"]
+            bt_path = raw / "bt" / "registered_products.csv"
+            write_csv(
+                bt_path,
+                [
+                    {
+                        "Sr. No": str(index),
+                        "Reg_No": case["source_product_key"],
+                        "Generic_Name": case["raw_ingredient_text"],
+                        "BrandName": case["product_name"],
+                        "Therapeutic Category": "source slice",
+                        "MAH": "source slice",
+                        "Packsize": "source slice",
+                        "Product_validity": "2028-12-31",
+                        "Manufacture": "source slice",
+                    }
+                    for index, case in enumerate(bt_cases, start=1)
+                ],
+            )
+
+            batches = {
+                "BD": BangladeshAdapter().stage(raw / "bd", EXTRACTION_DATE),
+                "BT": BhutanAdapter().stage(raw / "bt", EXTRACTION_DATE),
+            }
+
+        for case in cases:
+            batch = batches[case["country_code"]]
+            product = batch.products.set_index("source_product_key").loc[
+                case["source_product_key"]
+            ]
+            actual = batch.ingredients.loc[
+                batch.ingredients["source_product_key"].eq(case["source_product_key"]),
+                "normalized_ingredient_key",
+            ].tolist()
+            self.assertEqual(actual, case["expected_components"])
+            self.assertEqual(
+                int(product["ingredient_component_count"]),
+                len(case["expected_components"]),
+            )
+            self.assertEqual(int(product["unresolved_component_count"]), 0)
+
     def test_bhutan_swap_detector_does_not_prefer_strength_bearing_brand_text(self):
         self.assertEqual(
             _select_bhutan_generic_text(
@@ -630,6 +731,51 @@ class CountryAdapterContractTests(unittest.TestCase):
 
 
 class AtlasBuildTests(unittest.TestCase):
+    def test_build_fails_loudly_when_legacy_inputs_are_missing(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            (root / "data" / "raw" / "who" / "atc.csv").unlink()
+            (root / "data" / "raw" / "Rare Drugs.xls").unlink()
+            output_dir = root / "atlas"
+
+            with self.assertRaisesRegex(
+                FileNotFoundError, "legacy compatibility inputs are missing"
+            ):
+                build_atlas(
+                    BuildSpec(
+                        root=root,
+                        extraction_date=EXTRACTION_DATE,
+                        output_dir=output_dir,
+                    )
+                )
+
+        self.assertFalse(output_dir.exists())
+
+    def test_source_snapshots_expose_license_status_and_hsa_attribution(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            artifact = build_atlas(
+                BuildSpec(root=root, extraction_date=EXTRACTION_DATE, output_dir=root / "atlas")
+            )
+            with sqlite3.connect(artifact.database_path) as connection:
+                rows = {
+                    row[0]: row[1:]
+                    for row in connection.execute(
+                        "SELECT country_code, license_name, license_url, "
+                        "license_status, attribution FROM source_snapshots"
+                    )
+                }
+
+        self.assertEqual(rows["SG"][0], "Singapore Open Data Licence version 1.0")
+        self.assertEqual(rows["SG"][1], "https://data.gov.sg/open-data-licence")
+        self.assertEqual(rows["SG"][2], "licensed_open")
+        self.assertIn("Health Sciences Authority", rows["SG"][3])
+        self.assertIn(EXTRACTION_DATE.isoformat(), rows["SG"][3])
+        self.assertEqual(rows["BD"][2], "human_review_required")
+        self.assertEqual(rows["BT"][2], "human_review_required")
+
     def test_build_fails_closed_without_consolidated_fetch_manifest(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -824,6 +970,110 @@ class AtlasBuildTests(unittest.TestCase):
 
 
 class ComparisonQueryTests(unittest.TestCase):
+    def test_real_registry_vaccine_variants_never_publish_false_absence(self):
+        fixture = json.loads(REAL_SOURCE_REGRESSIONS.read_text(encoding="utf-8"))
+        cases = fixture["identity_cases"]
+        nonmatches = fixture["identity_nonmatches"]
+        source_cases = [*cases, *nonmatches]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            raw = root / "data" / "raw"
+
+            hsa_path = raw / "hsa" / "hsa_registered_therapeutic_products.csv"
+            hsa = pd.read_csv(hsa_path, dtype=str).fillna("")
+            for case in [item for item in source_cases if item["country_code"] == "SG"]:
+                hsa.loc[len(hsa)] = {
+                    "licence_no": case["source_product_key"],
+                    "product_name": case["product_name"],
+                    "approval_d": "2000-01-01",
+                    "atc_code": "J07BD52",
+                    "active_ingredients": case["raw_ingredient_text"],
+                    "license_holder": "Frozen HSA regression fixture",
+                }
+            hsa.to_csv(hsa_path, index=False)
+
+            bt_path = raw / "bt" / "registered_products.csv"
+            bt = pd.read_csv(bt_path, dtype=str).fillna("")
+            for ordinal, case in enumerate(
+                [item for item in source_cases if item["country_code"] == "BT"], start=6
+            ):
+                bt.loc[len(bt)] = {
+                    "Sr. No": str(ordinal),
+                    "Reg_No": case["source_product_key"],
+                    "Generic_Name": case["raw_ingredient_text"],
+                    "BrandName": case["product_name"],
+                    "Therapeutic Category": "Vaccines",
+                    "MAH": "Frozen Bhutan regression fixture",
+                    "Packsize": "source slice",
+                    "Product_validity": "2028-12-31",
+                    "Manufacture": "source slice",
+                }
+            bt.to_csv(bt_path, index=False)
+
+            bd_path = raw / "bd" / "dgda_concepts.json"
+            bd = json.loads(bd_path.read_text(encoding="utf-8"))
+            for case in [item for item in source_cases if item["country_code"] == "BD"]:
+                bd["concepts"].append(
+                    {
+                        "id": case["source_product_key"],
+                        "display_name": case["product_name"],
+                        "retired": False,
+                        "extras": {
+                            "dar_number": "363-0008-069",
+                            "trade_name": case["product_name"],
+                            "generic_content_raw": case["raw_ingredient_text"],
+                            "dosage_form": "Vaccine",
+                            "company": "Frozen Bangladesh regression fixture",
+                            "dar_quality_flag": "",
+                        },
+                    }
+                )
+            bd["metadata"]["num_found"] = len(bd["concepts"])
+            bd["metadata"]["num_returned"] = len(bd["concepts"])
+            bd_path.write_text(json.dumps(bd), encoding="utf-8")
+
+            eeml_path = raw / "who" / "eeml_2025.csv"
+            eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
+            for target in sorted(
+                {target for case in source_cases for target in case["eml_targets"]}
+            ):
+                eeml.loc[len(eeml)] = {
+                    "Medicine name": target,
+                    "EML section": "Frozen vaccine regression fixture",
+                    "Formulations": "source slice",
+                    "Indication": "",
+                    "ATC codes": "",
+                    "Combined with": "",
+                    "Status": "Added",
+                }
+            eeml.to_csv(eeml_path, index=False)
+
+            artifact = build_atlas(
+                BuildSpec(root=root, extraction_date=EXTRACTION_DATE, output_dir=root / "atlas")
+            )
+            comparison = compare_atlas(
+                artifact.database_path, countries=("SG", "BD", "BT")
+            )
+
+        by_pair = comparison.long.set_index(["preferred_name", "country_code"])
+        for case in cases:
+            for target in case["eml_targets"]:
+                row = by_pair.loc[(target, case["country_code"])]
+                self.assertEqual(
+                    row["observation"],
+                    "UNKNOWN",
+                    f"{case['country_code']} {target} must not publish a false absence",
+                )
+                self.assertEqual(
+                    row["uncertainty_reason"], "identity_match_requires_review"
+                )
+        for case in nonmatches:
+            for target in case["eml_targets"]:
+                row = by_pair.loc[(target, case["country_code"])]
+                self.assertEqual(row["observation"], "OBSERVED_ABSENCE")
+                self.assertEqual(row["uncertainty_reason"], "")
+
     def test_lexically_related_source_identity_makes_gap_unknown_not_absent(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1060,38 +1310,70 @@ class LegacyCompatibilityTests(unittest.TestCase):
         self.assertEqual(by_name.loc["metformin", "FDA Status"], "ABSENT")
         self.assertEqual(by_name.loc["metformin", "Availability"], "HSA_ONLY")
 
-    @unittest.skipUnless(
-        (Path(__file__).resolve().parents[1] / "data" / "raw" / "who" / "eeml_2025.xlsx").exists()
-        and (Path(__file__).resolve().parents[1] / "data" / "output" / "fda_hsa_by_actives.csv").exists(),
-        "full ignored raw snapshot is not available",
-    )
-    def test_full_snapshot_preserves_exact_non_eml_legacy_projection(self):
+    def test_frozen_legacy_renderer_preserves_exact_delivered_projection(self):
         root = Path(__file__).resolve().parents[1]
-        with TemporaryDirectory() as tmp:
-            artifact = build_atlas(
-                BuildSpec(
-                    root=root,
-                    extraction_date=EXTRACTION_DATE,
-                    output_dir=Path(tmp) / "atlas",
-                )
-            )
-            actual = render_legacy_compatibility(artifact.database_path)
-            with sqlite3.connect(artifact.database_path) as connection:
-                application_types = {
-                    row[0]
-                    for row in connection.execute(
-                        "SELECT DISTINCT application_type FROM registered_products "
-                        "WHERE country_code = 'US'"
-                    )
-                }
-                connection.execute("DELETE FROM legacy_compatibility_observations")
-                connection.commit()
-            atlas_projection = render_legacy_compatibility(artifact.database_path)
-
+        fixture = Path(__file__).parent / "fixtures" / "legacy_compatibility_observations.csv.gz"
+        self.assertEqual(
+            hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            "462a22272329c45190c073afee432e0a99b80e75fefbd46ae8b12cc1a885b566",
+        )
         reference = pd.read_csv(
             root / "data" / "output" / "fda_hsa_by_actives.csv",
             keep_default_na=False,
         )
+        observations = pd.read_csv(fixture, keep_default_na=False)
+        for column in ("is_combo", "is_rare", "is_on_who_eml"):
+            observations[column] = (
+                observations[column].astype(str).str.casefold().eq("true").astype(int)
+            )
+        eeml_fixture = Path(__file__).parent / "fixtures" / "legacy_eeml_keys.txt"
+        self.assertEqual(
+            hashlib.sha256(eeml_fixture.read_bytes()).hexdigest(),
+            "e1afaf8fab0440e5478575f3d90874144d4c518970f895a1bcb539459e9b5aa4",
+        )
+        eeml_names = eeml_fixture.read_text(encoding="utf-8").splitlines()
+        with TemporaryDirectory() as tmp:
+            database = Path(tmp) / "legacy.sqlite"
+            with sqlite3.connect(database) as connection:
+                observations.to_sql(
+                    "legacy_compatibility_observations",
+                    connection,
+                    if_exists="fail",
+                    index=False,
+                )
+                connection.executescript(
+                    """
+                    CREATE TABLE substances (
+                        substance_id TEXT PRIMARY KEY,
+                        normalized_ingredient_key TEXT NOT NULL
+                    );
+                    CREATE TABLE essential_medicine_entries (
+                        entry_id TEXT PRIMARY KEY,
+                        universe_id TEXT NOT NULL
+                    );
+                    CREATE TABLE essential_medicine_members (
+                        entry_id TEXT NOT NULL,
+                        substance_id TEXT NOT NULL
+                    );
+                    """
+                )
+                for ordinal, name in enumerate(eeml_names):
+                    substance_id = f"fixture-substance-{ordinal}"
+                    entry_id = f"fixture-entry-{ordinal}"
+                    connection.execute(
+                        "INSERT INTO substances VALUES (?, ?)", (substance_id, name)
+                    )
+                    connection.execute(
+                        "INSERT INTO essential_medicine_entries VALUES (?, ?)",
+                        (entry_id, "WHO_EML_2025"),
+                    )
+                    connection.execute(
+                        "INSERT INTO essential_medicine_members VALUES (?, ?)",
+                        (entry_id, substance_id),
+                    )
+                connection.commit()
+            actual = render_legacy_compatibility(database)
+
         self.assertEqual(list(actual.columns), list(reference.columns))
         self.assertEqual(len(actual), 2923)
         non_eml_columns = [column for column in reference if column != "WHO Essential Drug"]
@@ -1105,23 +1387,73 @@ class LegacyCompatibilityTests(unittest.TestCase):
             actual["Availability"].value_counts().to_dict(),
             {"FDA_ONLY": 1419, "NO GAP": 856, "HSA_ONLY": 523, "PARTIAL GAP": 125},
         )
-        self.assertEqual(application_types, {"NDA", "BLA", "ANDA"})
-        semantic_columns = [
-            "Active Ingredient",
-            "FDA Status",
-            "HSA Status",
-            "WHO Essential Drug",
-            "Availability",
-        ]
-        self.assertEqual(len(atlas_projection), 2923)
-        pd.testing.assert_frame_equal(
-            atlas_projection[semantic_columns].reset_index(drop=True),
-            actual[semantic_columns].reset_index(drop=True),
-            check_dtype=False,
-        )
+
+
+class SnapshotReferenceInputTests(unittest.TestCase):
+    def test_build_uses_legacy_references_from_selected_raw_snapshot(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            raw = root / "data" / "raw"
+            snapshot = root / "frozen-raw-snapshot"
+            shutil.copytree(raw, snapshot)
+            (raw / "who" / "atc.csv").unlink()
+            (raw / "Rare Drugs.xls").unlink()
+
+            artifact = build_atlas(
+                BuildSpec(
+                    root=root,
+                    raw_dir=snapshot,
+                    extraction_date=EXTRACTION_DATE,
+                    output_dir=root / "atlas",
+                )
+            )
+            manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["legacy_dependency_hashes"]["atc"],
+                hashlib.sha256((snapshot / "who" / "atc.csv").read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                manifest["legacy_dependency_hashes"]["rare_drugs"],
+                hashlib.sha256((snapshot / "Rare Drugs.xls").read_bytes()).hexdigest(),
+            )
 
 
 class FetchPublicationTests(unittest.TestCase):
+    def test_fetch_preflights_required_legacy_reference_inputs_before_network(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch(
+                "src.fetch_sources._fetch_fda",
+                side_effect=AssertionError("network fetch must not start"),
+            ):
+                with self.assertRaisesRegex(
+                    FileNotFoundError, "ATC.*Rare Drugs"
+                ):
+                    fetch_sources(root, EXTRACTION_DATE)
+
+    def test_fetch_rejects_malformed_legacy_inputs_before_network(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_legacy_reference_inputs(root)
+            cases = {
+                "ATC": (root / "data" / "raw" / "who" / "atc.csv", b""),
+                "Rare Drugs": (
+                    root / "data" / "raw" / "Rare Drugs.xls",
+                    b"not an html or spreadsheet table",
+                ),
+            }
+            for expected, (path, invalid_bytes) in cases.items():
+                with self.subTest(reference=expected):
+                    write_legacy_reference_inputs(root)
+                    path.write_bytes(invalid_bytes)
+                    with mock.patch(
+                        "src.fetch_sources._fetch_fda",
+                        side_effect=AssertionError("network fetch must not start"),
+                    ):
+                        with self.assertRaisesRegex(ValueError, expected):
+                            fetch_sources(root, EXTRACTION_DATE)
+
     def test_fetch_publishes_one_snapshot_and_switches_current_only_after_success(self):
         def fake_fetch(name: str):
             def implementation(destination, *args):
@@ -1136,6 +1468,7 @@ class FetchPublicationTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
+            write_legacy_reference_inputs(root)
             patches = (
                 mock.patch("src.fetch_sources._fetch_fda", side_effect=fake_fetch("US")),
                 mock.patch("src.fetch_sources._fetch_hsa", side_effect=fake_fetch("SG")),
@@ -1154,9 +1487,16 @@ class FetchPublicationTests(unittest.TestCase):
             self.assertEqual(artifact.manifest_path, current.resolve() / "manifest.json")
             manifest = json.loads(artifact.manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(set(manifest["countries"]), {"US", "SG", "BD", "BT"})
+            self.assertEqual(
+                manifest["artifacts"]["WHO_ATC"]["license_status"],
+                "human_review_required",
+            )
+            self.assertTrue((current.resolve() / "who" / "atc.csv").is_file())
+            self.assertTrue((current.resolve() / "Rare Drugs.xls").is_file())
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
+            write_legacy_reference_inputs(root)
             with mock.patch(
                 "src.fetch_sources._fetch_fda", side_effect=RuntimeError("network failed")
             ):

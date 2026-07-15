@@ -1,0 +1,134 @@
+{
+  "identity_cases": [
+    {
+      "country_code": "SG",
+      "source_product_key": "SIN02056P",
+      "product_name": "M-M-R II VACCINE",
+      "raw_ingredient_text": "MEASLES VIRUS (MORE ATTENUATED ENDER'S STRAIN) (LIVE)&&MUMPS VIRUS (JERYL LYNN STRAIN) (LIVE)&&RUBELLA VIRUS (WISTAR RA 27/3 STRAIN) (LIVE)",
+      "eml_targets": ["measles vaccine", "mumps vaccine"]
+    },
+    {
+      "country_code": "BT",
+      "source_product_key": "BHU-MPD/25/AR/H051",
+      "product_name": "",
+      "raw_ingredient_text": "Measles, Mumps and Rubella vaccine Live, Attenuated (Freeze-Dried)",
+      "eml_targets": ["measles vaccine", "mumps vaccine"]
+    },
+    {
+      "country_code": "BT",
+      "source_product_key": "BHU-MPD/24/AR/H041",
+      "product_name": "",
+      "raw_ingredient_text": "Live, attenuated - Bacille Calmette-Guérin Vaccine-20 doses",
+      "eml_targets": ["bcg vaccine"]
+    },
+    {
+      "country_code": "BD",
+      "source_product_key": "363-0008-069--poliovax",
+      "product_name": "Poliovax",
+      "raw_ingredient_text": "Poliomyelitis Vacine, Live (Oral)  .1 ml/.1 ml",
+      "eml_targets": ["poliomyelitis vaccine"]
+    },
+    {
+      "country_code": "SG",
+      "source_product_key": "SIN12099P",
+      "product_name": "DUKORAL VACCINE AGAINST CHOLERA AND ETEC-DIARRHOEA",
+      "raw_ingredient_text": "RECOMBINANT CHOLERA TOXIN B SUBUNIT (rCTB)&&VIBRIO CHOLERAE O1 INABA CLASSIC STRAIN (HEAT INACTIVATED)",
+      "eml_targets": ["cholera vaccine"]
+    },
+    {
+      "country_code": "SG",
+      "source_product_key": "SIN08728P",
+      "product_name": "Pneumovax 23",
+      "raw_ingredient_text": "PNEUMOCOCCAL POLYSACCHARIDES 23 MOST PREVALENT TYPES",
+      "eml_targets": ["pneumococcal vaccine"]
+    },
+    {
+      "country_code": "SG",
+      "source_product_key": "SIN15255P",
+      "product_name": "GARDASIL 9 SUSPENSION FOR INJECTION",
+      "raw_ingredient_text": "Human Papillomavirus Type 11 L1 Protein&&Human Papillomavirus Type 16 L1 Protein",
+      "eml_targets": ["papilloma virus vaccine"]
+    },
+    {
+      "country_code": "SG",
+      "source_product_key": "SIN13922P",
+      "product_name": "Menactra, solution for injection",
+      "raw_ingredient_text": "Diphtheria Toxoid Protein&&Meningococcal (Serogroup A) Polysaccharide (Monovalent Conjugate)&&Meningococcal (Serogroup C) Polysaccharide (Monovalent Conjugate)",
+      "eml_targets": ["meningococcal meningitis vaccine"]
+    }
+  ],
+  "identity_nonmatches": [
+    {
+      "country_code": "SG",
+      "source_product_key": "FROZEN-RABIES-IMMUNOGLOBULIN",
+      "product_name": "RABIES IMMUNOGLOBULIN",
+      "raw_ingredient_text": "RABIES IMMUNOGLOBULIN",
+      "eml_targets": ["rabies vaccine"]
+    },
+    {
+      "country_code": "SG",
+      "source_product_key": "FROZEN-HEPATITIS-B",
+      "product_name": "HEPATITIS B VACCINE",
+      "raw_ingredient_text": "HEPATITIS B SURFACE ANTIGEN",
+      "eml_targets": ["hepatitis a vaccine", "hepatitis e vaccine"]
+    },
+    {
+      "country_code": "SG",
+      "source_product_key": "FROZEN-JAPANESE-ENCEPHALITIS",
+      "product_name": "JAPANESE ENCEPHALITIS VACCINE",
+      "raw_ingredient_text": "JAPANESE ENCEPHALITIS VIRUS",
+      "eml_targets": ["tick borne encephalitis vaccine"]
+    },
+    {
+      "country_code": "SG",
+      "source_product_key": "FROZEN-GLYCERYL-TRINITRATE",
+      "product_name": "GLYCERYL TRINITRATE TABLET",
+      "raw_ingredient_text": "GLYCERYL TRINITRATE",
+      "eml_targets": ["glycerol"]
+    },
+    {
+      "country_code": "SG",
+      "source_product_key": "FROZEN-CLIDINIUM",
+      "product_name": "CLIDINIUM TABLET",
+      "raw_ingredient_text": "CLIDINIUM",
+      "eml_targets": ["aclidinium"]
+    }
+  ],
+  "parser_cases": [
+    {
+      "country_code": "BD",
+      "source_product_key": "053-0031-059--renal-care-ac",
+      "product_name": "Renal Care AC",
+      "raw_ingredient_text": "Calcium Chloride + Magnessium Chloride + Potassium Chloride + Sodium Acetate + Sodium Chloride  .514 % + .356 % + .521 % + 18.088 % + 19.84 %",
+      "expected_components": ["calcium chloride", "magnesium chloride", "potassium chloride", "sodium acetate", "sodium chloride"]
+    },
+    {
+      "country_code": "BD",
+      "source_product_key": "308-0139-031--hunny",
+      "product_name": "Hunny",
+      "raw_ingredient_text": "Glycerine + Liquid Sugar  .75 ml + 1.93 ml/5 ml",
+      "expected_components": ["glycerine", "liquid sugar"]
+    },
+    {
+      "country_code": "BT",
+      "source_product_key": "BHU-MPD/25/H267",
+      "product_name": "",
+      "raw_ingredient_text": "Calamine, Diphenhydramine Hydrochloride and Camphor Lotion",
+      "expected_components": ["calamine", "diphenhydramine", "camphora"]
+    },
+    {
+      "country_code": "BT",
+      "source_product_key": "BHU-MPD/24/H049",
+      "product_name": "ELECTRORUSH",
+      "raw_ingredient_text": "Oral Rehydration Salts B.P.",
+      "expected_components": ["rehydration salts"]
+    },
+    {
+      "country_code": "BT",
+      "source_product_key": "BHU-MPD/25/H302",
+      "product_name": "",
+      "raw_ingredient_text": "Paracetamol Tablets I.P",
+      "expected_components": ["paracetamol"]
+    }
+  ]
+}

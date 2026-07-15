@@ -17,8 +17,12 @@ extraction date.
 ```bash
 python -m pip install -r requirements.txt
 
-# Refresh all four regulator sources plus the eEML into one immutable snapshot.
-python -m src.fetch_sources --extraction-date 2026-07-15
+# Refresh all four regulators plus the eEML and bind the required local
+# ATC/Rare reference inputs into one immutable snapshot.
+python -m src.fetch_sources \
+  --extraction-date 2026-07-15 \
+  --atc-path data/raw/who/atc.csv \
+  --rare-drugs-path 'data/raw/Rare Drugs.xls'
 
 # Build all four countries from data/raw/current without network access.
 python -m src.atlas build --extraction-date 2026-07-15
@@ -37,8 +41,14 @@ python -m src.atlas compare \
   --current-qualified-countries BT \
   --output-dir data/atlas/ad-hoc-bt-current
 
-python -m unittest discover -s tests
+python -m pytest -q
 ```
+
+`src.fetch_sources` preflights the ATC CSV and FDA Rare Drugs export before making any network
+request, copies them into the dated snapshot, and records their hashes. The build fails if either is
+absent; it never substitutes an empty legacy renderer. Refresh/source instructions for these two
+inputs remain in `../satvik-project/docs/DATA_SOURCES.md`. The ATC bulk-file redistribution decision
+is intentionally not made by this repository.
 
 The fetch first publishes `data/raw/snapshots/<extraction-date>/`, then atomically switches the
 `data/raw/current` pointer only after all four country sources and the eEML validate. The build
@@ -67,9 +77,10 @@ counts must also clear conservative source-specific plausibility floors:
   20 non-EML columns exactly. Its WHO flag is intentionally refreshed from the open 2025 eEML.
 - `OBSERVED_ABSENCE` means an ingredient was not observed in an accepted ingested register snapshot.
   It does not mean a drug is illegal or definitively unregistered in the country.
-- A broader or more-specific source identity with strict normalized-token overlap produces
-  `UNKNOWN`, not absence. These review holds are stored with both substance IDs and source-country
-  provenance; they never count as presence without an approved equivalence.
+- Broader/specific identities, a reviewed spelling-variant set, full disease-signature vaccine
+  variants, reviewed vaccine product families, and supported acronym expansions produce `UNKNOWN`,
+  not absence. These review holds are stored with both substance IDs and source-country provenance;
+  they never count as presence without an approved equivalence.
 - The primary four-country comparison uses listed presence. Bhutan validity and matching regulatory
   actions are also emitted as a separate current-qualified comparison because Bangladesh cannot
   support an equivalent legal-current determination. Colliding or ambiguous action evidence is
@@ -87,6 +98,9 @@ counts must also clear conservative source-specific plausibility floors:
 - `source_as_of_date=unknown` is preserved when a regulator does not publish a reliable update date;
   it is never replaced with the extraction date. Source URLs, acceptance reason, coverage, and
   bounded absence wording are stored with each snapshot.
+- Every national snapshot stores licence name, URL, status, and attribution. HSA uses the Singapore
+  Open Data Licence 1.0 attribution. Bangladesh, Bhutan, and the local WHO ATC bulk input remain
+  explicitly `human_review_required`; that flag is not a legal conclusion.
 
 WHO attribution: WHO electronic Essential Medicines List (eEML), World Health Organization, 2020.
 https://list.essentialmeds.org/ (beta version 1.0). Licence: CC BY 3.0 IGO.
@@ -95,5 +109,8 @@ WHO adaptation notice: This is an adaptation of an original work by World Health
 (WHO). Views and opinions expressed in the adaptation are the sole responsibility of the author or
 authors of the adaptation and are not endorsed by World Health Organization (WHO).
 
-The original two-country build remains available as `python -m src.pipeline`. It is intentionally
-kept intact as an independent regression surface.
+The original two-country build remains available as `python -m src.pipeline`. The atlas compatibility
+renderer intentionally consumes a preserved old-pipeline observation sidecar for historical
+ATC/class/rare columns. It is not a pure projection of the normalized atlas tables; only its
+availability semantics can be reproduced from those tables. A committed frozen sidecar fixture keeps
+all 2,923 rows and 20 historical non-EML columns under clean-clone regression.

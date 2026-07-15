@@ -20,7 +20,7 @@ import unicodedata
 import uuid
 import zipfile
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Protocol
 from xml.etree import ElementTree
@@ -50,7 +50,8 @@ from .pipeline import (
 
 
 ATLAS_NAMESPACE = uuid.UUID("186c4a4a-a3aa-5be5-968d-ce32b54e4054")
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
+SUBSTANCE_IDENTITY_VERSION = "normalized-ingredient-key-v1"
 UNIVERSE_ID = "WHO_EML_2025"
 SUPPORTED_COUNTRIES = ("US", "SG", "BD", "BT")
 MINIMUM_DECLARED_ROWS = {
@@ -92,6 +93,23 @@ WHO_ADAPTATION_NOTICE = (
     "author or authors of the adaptation and are not endorsed by World Health Organization "
     "(WHO)."
 )
+LEGACY_DEPENDENCY_LICENSES = {
+    "pipeline": {
+        "license_name": "Repository code",
+        "license_url": "",
+        "license_status": "internal_build_logic",
+    },
+    "atc": {
+        "license_name": "WHO ATC/DDD Index terms",
+        "license_url": "https://atcddd.fhi.no/copyright_disclaimer/",
+        "license_status": "human_review_required",
+    },
+    "rare_drugs": {
+        "license_name": "U.S. FDA public source",
+        "license_url": "https://www.accessdata.fda.gov/scripts/opdlisting/oopd/",
+        "license_status": "reviewed_public_government_source",
+    },
+}
 IDENTITY_UNCERTAINTY_STOP_TOKENS = frozenset(
     {
         "acid",
@@ -117,6 +135,32 @@ IDENTITY_UNCERTAINTY_STOP_TOKENS = frozenset(
         "virus",
     }
 )
+REVIEWED_SPELLING_VARIANTS = frozenset(
+    {
+        frozenset(("anastrozole", "anastrozol")),
+        frozenset(("carbimazole", "cabimazole")),
+        frozenset(("chloramphenicol", "chloramphenical")),
+        frozenset(("enoxaparin", "enoxaprin")),
+        frozenset(("insulin glargine", "insulin glargin")),
+        frozenset(("levodopa", "leodopa")),
+        frozenset(("metformin", "metformine")),
+        frozenset(("polymyxin b", "polimixin b")),
+        frozenset(("procaine benzylpenicillin", "procain benzylpenicillin")),
+        frozenset(("propranolol", "propanolol")),
+        frozenset(("protamine", "protamin")),
+        frozenset(("riboflavin", "riboflavine")),
+        frozenset(("thiopental", "thipental")),
+        frozenset(("tioguanine", "thioguanine")),
+        frozenset(("trastuzumab", "trustuzumab")),
+        frozenset(("trihexyphenidyl", "trihexiphenidyl")),
+    }
+)
+VACCINE_PRODUCT_FAMILY_MARKERS = {
+    "cholera vaccine": ("cholera",),
+    "pneumococcal vaccine": ("pneumococcal", "pneumovax", "prevenar"),
+    "papilloma virus vaccine": ("papillomavirus", "gardasil"),
+    "meningococcal meningitis vaccine": ("meningococcal",),
+}
 
 PRODUCT_COLUMNS = [
     "country_code",
@@ -172,6 +216,10 @@ class SourcePolicy:
     coverage_scope: str
     observed_absence_wording: str
     status_semantics: str
+    license_name: str
+    license_url: str
+    license_status: str
+    attribution: str
 
 
 @dataclass(frozen=True)
@@ -236,6 +284,10 @@ class FdaAdapter:
         ),
         observed_absence_wording="Not observed in the ingested Drugs@FDA snapshot.",
         status_semantics="Application and marketing fields are retained as source observations.",
+        license_name="U.S. FDA public source",
+        license_url="https://www.fda.gov/about-fda/about-website/website-policies",
+        license_status="reviewed_public_government_source",
+        attribution="U.S. Food and Drug Administration, Drugs@FDA.",
     )
 
     def stage(self, raw_dir: Path, extraction_date: date) -> AdapterBatch:
@@ -402,6 +454,14 @@ class HsaAdapter:
         coverage_scope="Therapeutic products appearing in the ingested HSA register snapshot.",
         observed_absence_wording="Not observed in the ingested HSA register snapshot.",
         status_semantics="Register presence is not a separate assertion of current marketing.",
+        license_name="Singapore Open Data Licence version 1.0",
+        license_url="https://data.gov.sg/open-data-licence",
+        license_status="licensed_open",
+        attribution=(
+            "Contains information from Listing of Registered Therapeutic Products accessed on "
+            "{access_date} from the Health Sciences Authority via data.gov.sg, made available "
+            "under the Singapore Open Data Licence version 1.0."
+        ),
     )
 
     def stage(self, raw_dir: Path, extraction_date: date) -> AdapterBatch:
@@ -538,6 +598,10 @@ class BangladeshAdapter:
         status_semantics=(
             "The source does not publish reliable approval, expiry, or legal-status fields."
         ),
+        license_name="No redistribution licence recorded",
+        license_url=BD_SOURCE_URL,
+        license_status="human_review_required",
+        attribution="Bangladesh DGDA registered-drugs terminology mirror via Open Concept Lab.",
     )
 
     def stage(self, raw_dir: Path, extraction_date: date) -> AdapterBatch:
@@ -657,6 +721,10 @@ class BhutanAdapter:
             "no general inference about legal status is made."
         ),
         status_semantics="Validity and published actions are evaluated as of the supplied extraction date.",
+        license_name="No redistribution licence recorded",
+        license_url=BT_PRODUCTS_URL,
+        license_status="human_review_required",
+        attribution="Bhutan Drug Regulatory Authority registered medicinal products register.",
     )
 
     def stage(self, raw_dir: Path, extraction_date: date) -> AdapterBatch:
@@ -910,8 +978,10 @@ def _validate_fetch_manifest(
             (raw_root / "bt" / "regulatory_actions.csv", "actions_sha256"),
         ],
         UNIVERSE_ID: [(raw_root / "who" / "eeml_2025.xlsx", "sha256")],
+        "WHO_ATC": [(raw_root / "who" / "atc.csv", "sha256")],
+        "FDA_RARE": [(raw_root / "Rare Drugs.xls", "sha256")],
     }
-    for record_key in (*country_codes, UNIVERSE_ID):
+    for record_key in (*country_codes, UNIVERSE_ID, "WHO_ATC", "FDA_RARE"):
         record = records.get(record_key)
         if not isinstance(record, dict):
             raise ValueError(f"Fetch manifest is missing artifact record {record_key}")
@@ -1049,7 +1119,7 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
         _validate_adapter_batch(code, batch)
     if fetch_manifest is not None:
         _validate_manifest_counts(fetch_manifest, batches)
-    legacy_rows = _build_legacy_observations(root, raw_root)
+    legacy_rows = _build_legacy_observations(raw_root)
 
     normalizer_path = Path(__file__).with_name("normalize.py")
     source_hashes = {
@@ -1058,8 +1128,8 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
     eeml_logical_hash = _dataframe_hash(eeml[EEML_COLUMNS])
     legacy_dependency_paths = {
         "pipeline": Path(__file__).with_name("pipeline.py"),
-        "atc": root / "data" / "raw" / "who" / "atc.csv",
-        "rare_drugs": root / "data" / "raw" / "Rare Drugs.xls",
+        "atc": raw_root / "who" / "atc.csv",
+        "rare_drugs": raw_root / "Rare Drugs.xls",
     }
     legacy_dependency_hashes = {
         name: _file_hash(path) if path.exists() else "not-present"
@@ -1167,6 +1237,7 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
                     name: {
                         "path": _display_path(path, root),
                         "sha256": legacy_dependency_hashes[name],
+                        **LEGACY_DEPENDENCY_LICENSES[name],
                     }
                     for name, path in legacy_dependency_paths.items()
                 },
@@ -1736,7 +1807,7 @@ def _split_south_asia_ingredients(value: object) -> list[tuple[str, str]]:
     result: list[tuple[str, str]] = []
     for raw in _south_asia_raw_components(value):
         normalized = _normalize_south_asia_component(raw)
-        if len(normalized) >= 3:
+        if len(normalized) >= 3 and _has_ingredient_signal(normalized):
             result.append((raw, normalized))
     return result
 
@@ -1747,12 +1818,14 @@ def _south_asia_raw_components(value: object) -> list[str]:
         return []
     text = re.sub(r"\bINN\b", " ", text, flags=re.IGNORECASE)
     name_segment = re.split(
-        r"\s{2,}(?=[(<]*\d)", text, maxsplit=1, flags=re.IGNORECASE
+        r"\s{2,}(?=[(<]*\.?\d)", text, maxsplit=1, flags=re.IGNORECASE
     )[0]
     raw_parts = re.split(
-        r"\s*\+\s*|\s*;\s*|\s*&\s*|\s+and\s+",
+        r"\s*\+\s*|\s*;\s*|(?<!\d)\s*&\s*(?!\d)|"
+        r"\s+(?i:and)\s+(?=[A-Za-z])|"
+        r",\s*(?=(?!(?i:attenuated|live|inactivated|oral|freeze(?:-dried)?|"
+        r"dried|equivalent|providing|corresponding|contains)\b)[A-Z])",
         name_segment,
-        flags=re.IGNORECASE,
     )
     result: list[str] = []
     for raw in raw_parts:
@@ -1763,13 +1836,22 @@ def _south_asia_raw_components(value: object) -> list[str]:
         ):
             continue
         cleaned = raw.strip()
-        if cleaned:
+        if cleaned and _has_ingredient_signal(cleaned):
             result.append(cleaned)
     return result
 
 
 def _normalize_south_asia_component(value: object) -> str:
     text = str(value)
+    text = re.sub(r"\bmagnessium\b", "magnesium", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bvacine\b", "vaccine", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(?:I\s*\.\s*P|B\s*\.\s*P|U\s*\.\s*S\s*\.\s*P)\.?",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"[- ]+\d+\s*doses?\b", " ", text, flags=re.IGNORECASE)
     text = re.sub(
         r"\b(?:eye|ophthalmic)\s+(drops?|ointments?|solutions?)\b",
         r"\1",
@@ -1784,6 +1866,27 @@ def _normalize_south_asia_component(value: object) -> str:
     )
     text = re.sub(r"\b(?:w\s*/\s*v|v\s*/\s*v|w\s*/\s*w)\b", " ", text, flags=re.IGNORECASE)
     return normalize_ingredient(text)
+
+
+def _has_ingredient_signal(value: object) -> bool:
+    tokens = re.findall(r"[A-Za-z]+", str(value).casefold())
+    non_identity_tokens = {
+        "g",
+        "gm",
+        "iu",
+        "mcg",
+        "mg",
+        "microgram",
+        "micrograms",
+        "milligram",
+        "milligrams",
+        "ml",
+        "unit",
+        "units",
+        "v",
+        "w",
+    }
+    return any(token not in non_identity_tokens for token in tokens)
 
 
 def _normalize_registration_number(value: object) -> str:
@@ -1909,10 +2012,10 @@ def _eeml_medicine_components(value: object) -> list[str]:
     return components
 
 
-def _build_legacy_observations(root: Path, regulator_raw_root: Path) -> pd.DataFrame:
+def _build_legacy_observations(regulator_raw_root: Path) -> pd.DataFrame:
     """Reuse the delivered two-country logic as an explicit compatibility seam."""
 
-    raw_dir = root / "data" / "raw"
+    raw_dir = regulator_raw_root
     required = [
         raw_dir / "who" / "atc.csv",
         raw_dir / "Rare Drugs.xls",
@@ -1921,8 +2024,14 @@ def _build_legacy_observations(root: Path, regulator_raw_root: Path) -> pd.DataF
         regulator_raw_root / "fda" / "Submissions.txt",
         regulator_raw_root / "hsa" / "hsa_registered_therapeutic_products.csv",
     ]
-    if any(not path.exists() for path in required):
-        return pd.DataFrame(columns=LONG_COLUMNS)
+    missing = [path for path in required if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Required legacy compatibility inputs are missing: "
+            + ", ".join(str(path) for path in missing)
+            + ". Supply WHO ATC and FDA Rare Drugs inputs to src.fetch_sources; "
+            "the build will not publish an empty compatibility renderer."
+        )
 
     atc = load_atc(raw_dir / "who" / "atc.csv")
     atc_l5_lookup = build_atc_l5_lookup(atc)
@@ -1955,6 +2064,7 @@ def _build_legacy_observations(root: Path, regulator_raw_root: Path) -> pd.DataF
     rows = rows.drop_duplicates(
         ["source", "product_id", "substance_key", "atc_level5", "is_combo"]
     )[LONG_COLUMNS].reset_index(drop=True)
+    rows["approval_date"] = rows["approval_date"].map(_iso_date)
     for column in LONG_COLUMNS:
         if column == "approval_date":
             continue
@@ -2146,6 +2256,11 @@ def _build_table_frames(
             else {}
         )
         snapshot_id = _stable_id("snapshot", build_id, code)
+        captured_on_date = str(
+            manifest_record.get("captured_on")
+            or batch.metrics.get("captured_on_date")
+            or "unknown"
+        )
         snapshot_rows.append(
             {
                 "snapshot_id": snapshot_id,
@@ -2158,15 +2273,21 @@ def _build_table_frames(
                 "snapshot_status": "accepted",
                 "acceptance_reason": acceptance_reason,
                 "extraction_date": spec.extraction_date.isoformat(),
-                "captured_on_date": str(
-                    manifest_record.get("captured_on")
-                    or batch.metrics.get("captured_on_date")
-                    or "unknown"
-                ),
+                "captured_on_date": captured_on_date,
                 "source_as_of_date": str(batch.metrics.get("source_as_of_date") or "unknown"),
                 "coverage_scope": batch.policy.coverage_scope,
                 "observed_absence_wording": batch.policy.observed_absence_wording,
                 "status_semantics": batch.policy.status_semantics,
+                "license_name": batch.policy.license_name,
+                "license_url": batch.policy.license_url,
+                "license_status": batch.policy.license_status,
+                "attribution": batch.policy.attribution.format(
+                    access_date=(
+                        captured_on_date
+                        if captured_on_date != "unknown"
+                        else spec.extraction_date.isoformat()
+                    )
+                ),
                 "declared_row_count": int(batch.metrics.get("declared_row_count", len(batch.products))),
                 "parsed_row_count": int(batch.metrics.get("parsed_row_count", len(batch.products))),
                 "artifact_sha256": source_hashes[code],
@@ -2243,7 +2364,8 @@ def _build_table_frames(
         key for key in product_substance_keys | eeml_substance_keys if key
     )
     substance_id_for = {
-        key: _stable_id("substance", SCHEMA_VERSION, key) for key in all_substance_keys
+        key: _stable_id("substance", SUBSTANCE_IDENTITY_VERSION, key)
+        for key in all_substance_keys
     }
     substances = pd.DataFrame(
         [
@@ -2351,7 +2473,13 @@ def _build_table_frames(
 
     listed_source_identities = staged_ingredients.merge(
         registered_products[
-            ["country_code", "source_product_key", "included_in_presence"]
+            [
+                "country_code",
+                "source_product_key",
+                "product_name",
+                "raw_ingredient_text",
+                "included_in_presence",
+            ]
         ],
         on=["country_code", "source_product_key"],
         how="inner",
@@ -2361,25 +2489,33 @@ def _build_table_frames(
         listed_source_identities["included_in_presence"].eq(True)  # noqa: E712
     ]
     identity_uncertainty_rows: list[dict[str, object]] = []
+    seen_identity_uncertainties: set[tuple[str, str, str, str]] = set()
     for country_code in country_codes:
+        country_source_identities = listed_source_identities.loc[
+            listed_source_identities["country_code"].eq(country_code)
+        ]
         candidate_keys = sorted(
-            set(
-                listed_source_identities.loc[
-                    listed_source_identities["country_code"].eq(country_code),
-                    "normalized_ingredient_key",
-                ].astype(str)
-            )
+            set(country_source_identities["normalized_ingredient_key"].astype(str))
         )
         for target_key in sorted(eeml_substance_keys):
             for candidate_key in candidate_keys:
                 relation = _identity_uncertainty_relation(target_key, candidate_key)
                 if not relation:
                     continue
+                uncertainty_key = (
+                    country_code,
+                    target_key,
+                    candidate_key,
+                    relation,
+                )
+                if uncertainty_key in seen_identity_uncertainties:
+                    continue
+                seen_identity_uncertainties.add(uncertainty_key)
                 identity_uncertainty_rows.append(
                     {
                         "uncertainty_id": _stable_id(
                             "identity-uncertainty",
-                            SCHEMA_VERSION,
+                            SUBSTANCE_IDENTITY_VERSION,
                             spec.universe_id,
                             country_code,
                             target_key,
@@ -2391,12 +2527,59 @@ def _build_table_frames(
                         "target_substance_id": substance_id_for[target_key],
                         "candidate_substance_id": substance_id_for[candidate_key],
                         "relation": relation,
-                        "match_method": "normalized_token_containment_review_required",
+                        "match_method": f"{relation}_review_required",
                         "evidence_note": (
                             f"EML identity '{target_key}' and listed source identity "
-                            f"'{candidate_key}' have a strict normalized-token containment "
-                            "relationship. This is a review hold, not an equivalence or "
-                            "presence assertion."
+                            f"'{candidate_key}' have a review-required identity relationship. "
+                            "This is a review hold, not an equivalence or presence assertion."
+                        ),
+                    }
+                )
+            if target_key not in VACCINE_PRODUCT_FAMILY_MARKERS:
+                continue
+            for product in country_source_identities.itertuples(index=False):
+                if not _vaccine_product_family_match(
+                    target_key, product.product_name, product.raw_ingredient_text
+                ):
+                    continue
+                candidate_key = str(product.normalized_ingredient_key)
+                family_markers = VACCINE_PRODUCT_FAMILY_MARKERS[target_key]
+                if candidate_key == target_key or not any(
+                    marker in candidate_key for marker in family_markers
+                ):
+                    continue
+                relation = "source_identity_product_vaccine_family"
+                uncertainty_key = (
+                    country_code,
+                    target_key,
+                    candidate_key,
+                    relation,
+                )
+                if uncertainty_key in seen_identity_uncertainties:
+                    continue
+                seen_identity_uncertainties.add(uncertainty_key)
+                identity_uncertainty_rows.append(
+                    {
+                        "uncertainty_id": _stable_id(
+                            "identity-uncertainty",
+                            SUBSTANCE_IDENTITY_VERSION,
+                            spec.universe_id,
+                            country_code,
+                            target_key,
+                            candidate_key,
+                            relation,
+                        ),
+                        "universe_id": spec.universe_id,
+                        "country_code": country_code,
+                        "target_substance_id": substance_id_for[target_key],
+                        "candidate_substance_id": substance_id_for[candidate_key],
+                        "relation": relation,
+                        "match_method": "reviewed_vaccine_product_family_hold",
+                        "evidence_note": (
+                            f"EML identity '{target_key}' has review-required vaccine-family "
+                            f"evidence in listed product '{product.product_name}' through source "
+                            f"identity '{candidate_key}'. This is a review hold, not an "
+                            "equivalence or presence assertion."
                         ),
                     }
                 )
@@ -2466,6 +2649,10 @@ def _write_database(path: Path, frames: dict[str, pd.DataFrame]) -> None:
                 coverage_scope TEXT NOT NULL,
                 observed_absence_wording TEXT NOT NULL,
                 status_semantics TEXT NOT NULL,
+                license_name TEXT NOT NULL,
+                license_url TEXT NOT NULL,
+                license_status TEXT NOT NULL,
+                attribution TEXT NOT NULL,
                 declared_row_count INTEGER NOT NULL,
                 parsed_row_count INTEGER NOT NULL,
                 artifact_sha256 TEXT NOT NULL
@@ -2564,7 +2751,14 @@ def _write_database(path: Path, frames: dict[str, pd.DataFrame]) -> None:
                 target_substance_id TEXT NOT NULL REFERENCES substances(substance_id),
                 candidate_substance_id TEXT NOT NULL REFERENCES substances(substance_id),
                 relation TEXT NOT NULL CHECK (
-                    relation IN ('source_identity_more_specific', 'source_identity_broader')
+                    relation IN (
+                        'source_identity_more_specific',
+                        'source_identity_broader',
+                        'source_identity_vaccine_variant',
+                        'source_identity_product_vaccine_family',
+                        'source_identity_acronym_variant',
+                        'source_identity_spelling_variant'
+                    )
                 ),
                 match_method TEXT NOT NULL,
                 evidence_note TEXT NOT NULL,
@@ -2709,7 +2903,8 @@ def _write_views_and_report(
             """
             SELECT country_code, source_name, source_url, declared_row_count, parsed_row_count,
                    captured_on_date, source_as_of_date, snapshot_status, acceptance_reason,
-                   coverage_scope, observed_absence_wording, status_semantics
+                   coverage_scope, observed_absence_wording, status_semantics,
+                   license_name, license_url, license_status, attribution
             FROM source_snapshots
             """,
             connection,
@@ -2852,6 +3047,9 @@ def _write_views_and_report(
                 f"- Coverage: {snapshot['coverage_scope']}",
                 f"- Gap wording: {snapshot['observed_absence_wording']}",
                 f"- Status semantics: {snapshot['status_semantics']}",
+                f"- Licence: {snapshot['license_name']} ({snapshot['license_status']})",
+                f"- Licence URL: {snapshot['license_url']}",
+                f"- Attribution: {snapshot['attribution']}",
                 f"- Acceptance: {snapshot['acceptance_reason']}",
                 f"- Source URL: {snapshot['source_url']}",
                 "",
@@ -2880,9 +3078,10 @@ def _write_views_and_report(
             "## Identity review holds",
             "",
             "A review hold is emitted when no exact normalized identity is present but a listed "
-            "source identity has a strict broader or more-specific normalized-token relationship "
-            "to an EML identity. These candidates produce `UNKNOWN`, never presence or observed "
-            "absence, until a provenance-backed equivalence is approved.",
+            "source identity is a broader/specific token form, one-edit spelling, supported "
+            "vaccine naming variant, or BCG acronym expansion of an EML identity. These candidates "
+            "produce `UNKNOWN`, never presence or observed absence, until a provenance-backed "
+            "equivalence is approved.",
             "",
             "| Country | EML identities held from gap claims | Stored candidate relationships |",
             "|---|---:|---:|",
@@ -2957,7 +3156,9 @@ def _write_views_and_report(
             "",
             "The legacy compatibility columns retain ATC-derived metadata from the existing local "
             "working input. That input is not used as substance identity in the atlas, and its "
-            "bulk redistribution rights must be verified before a commercial release.",
+            "bulk redistribution rights are marked `human_review_required` and must be decided by "
+            "the project owner before a commercial release. Bangladesh and Bhutan redistribution "
+            "rights carry the same review status in their source snapshots.",
             "",
         ]
     )
@@ -3019,20 +3220,107 @@ def _identity_uncertainty_relation(target_key: str, candidate_key: str) -> str:
 
     if target_key == candidate_key:
         return ""
-    target_tokens = frozenset(re.findall(r"[a-z0-9]+", target_key.casefold()))
-    candidate_tokens = frozenset(re.findall(r"[a-z0-9]+", candidate_key.casefold()))
+    target_tokens = _identity_tokens(target_key)
+    candidate_tokens = _identity_tokens(candidate_key)
     if not target_tokens or not candidate_tokens:
         return ""
     discriminative_overlap = (
         (target_tokens & candidate_tokens) - IDENTITY_UNCERTAINTY_STOP_TOKENS
     )
-    if not any(len(token) >= 5 for token in discriminative_overlap):
-        return ""
-    if target_tokens < candidate_tokens:
-        return "source_identity_more_specific"
-    if candidate_tokens < target_tokens:
-        return "source_identity_broader"
+    if any(len(token) >= 5 for token in discriminative_overlap):
+        if target_tokens < candidate_tokens:
+            return "source_identity_more_specific"
+        if candidate_tokens < target_tokens:
+            return "source_identity_broader"
+    target_discriminators = target_tokens - IDENTITY_UNCERTAINTY_STOP_TOKENS
+    vaccine_source_markers = {
+        "antigen",
+        "attenuated",
+        "live",
+        "toxoid",
+        "vaccine",
+        "virus",
+    }
+    vaccine_disease_signature = target_tokens - {"human", "vaccine", "virus"}
+    vaccine_disease_match = bool(vaccine_disease_signature) and all(
+        any(
+            candidate == target
+            or (
+                len(target) >= 5
+                and _edit_distance_at_most_one(target, candidate)
+            )
+            for candidate in candidate_tokens
+        )
+        for target in vaccine_disease_signature
+    )
+    if (
+        "vaccine" in target_tokens
+        and vaccine_disease_match
+        and (
+            bool(candidate_tokens & vaccine_source_markers)
+            or len(candidate_tokens) == 1
+        )
+    ):
+        return "source_identity_vaccine_variant"
+    if "bcg" in target_tokens and {"bacille", "calmette", "guerin"}.issubset(
+        candidate_tokens
+    ):
+        return "source_identity_acronym_variant"
+    if frozenset((target_key, candidate_key)) in REVIEWED_SPELLING_VARIANTS:
+        return "source_identity_spelling_variant"
     return ""
+
+
+def _vaccine_product_family_match(
+    target_key: str, product_name: object, raw_ingredient_text: object
+) -> bool:
+    """Hold a small reviewed set of vaccine-family gaps for product-level review."""
+
+    markers = VACCINE_PRODUCT_FAMILY_MARKERS.get(target_key)
+    if not markers:
+        return False
+    evidence = unicodedata.normalize(
+        "NFKD", f"{product_name} {raw_ingredient_text}"
+    ).encode("ascii", "ignore").decode().casefold()
+    if not any(marker in evidence for marker in markers):
+        return False
+    vaccine_evidence_markers = {
+        "antigen",
+        "conjugate",
+        "inactivated",
+        "polysaccharide",
+        "protein",
+        "toxoid",
+        "vaccine",
+    }
+    return any(marker in evidence for marker in vaccine_evidence_markers)
+
+
+def _identity_tokens(value: str) -> frozenset[str]:
+    ascii_value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    return frozenset(re.findall(r"[a-z0-9]+", ascii_value.casefold()))
+
+
+def _edit_distance_at_most_one(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > 1:
+        return False
+    if len(left) > len(right):
+        left, right = right, left
+    index_left = index_right = differences = 0
+    while index_left < len(left) and index_right < len(right):
+        if left[index_left] == right[index_right]:
+            index_left += 1
+            index_right += 1
+            continue
+        differences += 1
+        if differences > 1:
+            return False
+        if len(left) == len(right):
+            index_left += 1
+        index_right += 1
+    return True
 
 
 def _stable_id(*parts: object) -> str:
