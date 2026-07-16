@@ -1401,11 +1401,13 @@ def compare_atlas(
             raise ValueError(f"Countries are not tracked in this build: {', '.join(unknown)}")
         universe = pd.read_sql_query(
             """
-            SELECT DISTINCT s.substance_id, s.preferred_name
+            SELECT s.substance_id, s.preferred_name,
+                   GROUP_CONCAT(DISTINCT entry.eml_section) AS eml_sections
             FROM essential_medicine_members AS member
             JOIN essential_medicine_entries AS entry USING (entry_id)
             JOIN substances AS s USING (substance_id)
             WHERE entry.universe_id = ?
+            GROUP BY s.substance_id, s.preferred_name
             ORDER BY s.preferred_name
             """,
             connection,
@@ -1652,7 +1654,9 @@ def compare_atlas(
                     (country_code, substance.substance_id)
                 )
                 missing_category_source = external_source_for_observation(
-                    country_code, substance.preferred_name
+                    country_code,
+                    substance.preferred_name,
+                    substance.eml_sections,
                 )
                 if country_code == "BD":
                     needs_external_sources.append(
@@ -2109,6 +2113,18 @@ def _bhutan_raw_components(value: object) -> list[str]:
     text = "" if value is None else str(value).strip()
     if not text:
         return []
+    text = re.sub(
+        r"(?i)(\bthiamine mononitrate)\.\s*(?=pyridoxine hydrochloride\b)",
+        r"\1, ",
+        text,
+    )
+    lipid_emulsion = re.fullmatch(
+        r"(?i)intravenous fat emulsion\s+with\s+"
+        r"(medium\s+and\s+long\s+chain\s+triglycerides.*)",
+        text,
+    )
+    if lipid_emulsion:
+        text = lipid_emulsion.group(1)
     components: list[str] = []
     with_parts = re.split(r"\s+(?i:with)\s+(?=[A-Za-z])", text)
     for with_part in with_parts:

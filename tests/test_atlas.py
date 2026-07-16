@@ -450,6 +450,19 @@ class AtlasAdjudicationTests(unittest.TestCase):
                     external_source_for_observation("US", concept),
                     "FDA_CBER_OR_PURPLE_BOOK",
                 )
+        for concept in (
+            "anti rabies virus monoclonal antibodies",
+            "category sibling fixture",
+        ):
+            with self.subTest(concept=concept):
+                self.assertEqual(
+                    external_source_for_observation(
+                        "US",
+                        concept,
+                        "Sera, immunoglobulins and monoclonal antibodies",
+                    ),
+                    "FDA_CBER_OR_PURPLE_BOOK",
+                )
         self.assertEqual(external_source_for_observation("US", "metformin"), "")
 
 
@@ -1258,6 +1271,19 @@ class CountryAdapterContractTests(unittest.TestCase):
                 },
             },
             {
+                "id": "077-0022-006--paracetamol",
+                "display_name": "Paracetamol",
+                "retired": False,
+                "extras": {
+                    "dar_number": "077-0022-006",
+                    "trade_name": "Paracetamol",
+                    "generic_content_raw": "Paracetamol 500 mg",
+                    "dosage_form": "Tablet",
+                    "company": "Decent Pharma",
+                    "dar_quality_flag": "",
+                },
+            },
+            {
                 "id": "100-0002-001--paracetamol",
                 "display_name": "Paracetamol",
                 "retired": False,
@@ -1296,9 +1322,14 @@ class CountryAdapterContractTests(unittest.TestCase):
                     products.loc[product_key, "exclusion_reason"],
                     "outside_human_scope_veterinary",
                 )
-        self.assertTrue(
-            bool(products.loc["100-0002-001--paracetamol", "included_in_presence"])
-        )
+        for product_key in (
+            "077-0022-006--paracetamol",
+            "100-0002-001--paracetamol",
+        ):
+            with self.subTest(product_key=product_key):
+                self.assertTrue(
+                    bool(products.loc[product_key, "included_in_presence"])
+                )
 
     def test_bangladesh_missing_generic_is_unresolved_not_brand_identity(self):
         with TemporaryDirectory() as tmp:
@@ -1366,7 +1397,7 @@ class CountryAdapterContractTests(unittest.TestCase):
         self.assertEqual(products.loc["BHU-DRA/23/RN/H159", "product_name"], "OPTIVIEW Lubricant Eye Drop")
         self.assertIn("generic_brand_fields_swapped", set(batch.issues["issue_code"]))
 
-    def test_bhutan_adapter_decomposes_and_with_multi_active_products(self):
+    def test_bhutan_adapter_applies_reviewed_row_level_cleanups(self):
         additions = [
             (
                 "BHU-MPD/25/RN/H235",
@@ -1391,7 +1422,34 @@ class CountryAdapterContractTests(unittest.TestCase):
                 "Intravenous Fat Emulsion with Medium and Long Chain "
                 "Triglycerides (20% w/v)",
                 "CELEPIDMCT-LCT 20%",
-                {"fat", "medium and long chain triglycerides"},
+                {"medium and long chain triglycerides"},
+            ),
+            (
+                "BHU-DRA/23/ER/H201",
+                "Thiamine Mononitrate. Pyridoxine Hydrochloride,Niacinamide, "
+                "Cyanocobalamin and Calcium Pantothenate Tablets",
+                "Neuromax-Forte",
+                {
+                    "thiamine",
+                    "pyridoxine",
+                    "nicotinamide",
+                    "cyanocobalamin",
+                    "pantothenic acid",
+                },
+            ),
+            (
+                "BHU-MPD/25/H199",
+                "Levonorgestrel and Ethinylestradiol Tablets BP with Ferrous "
+                "Fumarate Tablets BP",
+                "Evron-28 Plus",
+                {"levonorgestrel", "ethinylestradiol", "ferrous fumarate"},
+            ),
+            (
+                "BHU-MPD-25/H307",
+                "Levonorgestrel and Ethinylestradiol Tablets BP with Ferrous "
+                "Fumarate Tablets BP",
+                "Contrament",
+                {"levonorgestrel", "ethinylestradiol", "ferrous fumarate"},
             ),
         ]
         with TemporaryDirectory() as tmp:
@@ -1428,8 +1486,33 @@ class CountryAdapterContractTests(unittest.TestCase):
                 self.assertEqual(actual, expected)
                 self.assertEqual(
                     int(staged_products.loc[registration, "ingredient_component_count"]),
-                    2,
+                    len(expected),
                 )
+
+        for registration in ("BHU-MPD/25/H199", "BHU-MPD-25/H307"):
+            product = staged_products.loc[registration]
+            ingredient_keys = frozenset(
+                batch.ingredients.loc[
+                    batch.ingredients["source_product_key"].eq(registration),
+                    "normalized_ingredient_key",
+                ]
+            )
+            adjudication = adjudicate_eml_concept_product(
+                "ferrous salt",
+                country_code="BT",
+                product_name=product["product_name"],
+                raw_ingredient_text=product["raw_ingredient_text"],
+                form=product["form"],
+                strength=product["strength"],
+                product_atc_codes=product["product_atc_codes"],
+                ingredient_keys=ingredient_keys,
+            )
+            self.assertIsNotNone(adjudication)
+            self.assertEqual(adjudication.state, "INDETERMINATE")
+            self.assertEqual(
+                adjudication.rule,
+                "bt_contraceptive_ferrous_salt_strength_unverified",
+            )
 
     def test_bhutan_current_qualification_requires_actions_snapshot(self):
         with TemporaryDirectory() as tmp:
@@ -2065,6 +2148,110 @@ class ComparisonQueryTests(unittest.TestCase):
         )
         self.assertEqual(int(row["standalone_product_count"]), 0)
         self.assertEqual(int(row["combo_product_count"]), 0)
+
+    def test_benzathine_synonyms_share_eml_identity_without_merging_benzylpenicillin(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            append_fda_fixture_product(
+                root,
+                appl_no="4",
+                product_no="001",
+                drug_name="BICILLIN L-A",
+                active_ingredient="PENICILLIN G BENZATHINE",
+                form="SUSPENSION;INTRAMUSCULAR",
+                strength="2400000 UNITS/4ML",
+            )
+
+            bd_path = root / "data" / "raw" / "bd" / "dgda_concepts.json"
+            payload = json.loads(bd_path.read_text(encoding="utf-8"))
+            payload["concepts"].extend(
+                [
+                    {
+                        "id": "bd-benzathine",
+                        "display_name": "Benzapen",
+                        "retired": False,
+                        "extras": {
+                            "dar_number": "100-0003-001",
+                            "trade_name": "Benzapen",
+                            "generic_content_raw": "Benzathine Penicillin 12 lac units",
+                            "dosage_form": "Injection",
+                        },
+                    },
+                    {
+                        "id": "bd-benzylpenicillin",
+                        "display_name": "Benzylpenicillin",
+                        "retired": False,
+                        "extras": {
+                            "dar_number": "100-0004-001",
+                            "trade_name": "Benzylpenicillin",
+                            "generic_content_raw": "Benzylpenicillin 1 gm",
+                            "dosage_form": "Injection",
+                        },
+                    },
+                ]
+            )
+            payload["metadata"]["num_found"] = len(payload["concepts"])
+            payload["metadata"]["num_returned"] = len(payload["concepts"])
+            bd_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            bt_path = root / "data" / "raw" / "bt" / "registered_products.csv"
+            bt = pd.read_csv(bt_path, dtype=str).fillna("")
+            bt.loc[len(bt)] = {
+                "Sr. No": "6",
+                "Reg_No": "BHU-MPD/24/ER/H157",
+                "Generic_Name": "Penicillin G Benzathine 2.4 million units",
+                "BrandName": "Benzathine Penicillin",
+                "Therapeutic Category": "Antibiotic",
+                "MAH": "BT Holder",
+                "Packsize": "1 vial",
+                "Product_validity": "2028-12-31",
+                "Manufacture": "BT Maker",
+            }
+            bt.to_csv(bt_path, index=False)
+
+            eeml_path = root / "data" / "raw" / "who" / "eeml_2025.csv"
+            eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
+            for medicine_name in (
+                "benzathine benzylpenicillin",
+                "benzylpenicillin",
+            ):
+                eeml.loc[len(eeml)] = {
+                    "Medicine name": medicine_name,
+                    "EML section": "Anti-infective medicines",
+                    "Formulations": "injection",
+                    "Indication": "",
+                    "ATC codes": "J01CE08" if "benzathine" in medicine_name else "J01CE01",
+                    "Combined with": "",
+                    "Status": "Added",
+                }
+            eeml.to_csv(eeml_path, index=False)
+
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+            result = compare_atlas(artifact.database_path, ("US", "SG", "BD", "BT"))
+
+        rows = result.long.set_index(["preferred_name", "country_code"])
+        benzathine = rows.loc["benzathine benzylpenicillin"]
+        self.assertEqual(
+            benzathine["observation"].to_dict(),
+            {
+                "BD": "STANDALONE",
+                "BT": "STANDALONE",
+                "SG": "OBSERVED_ABSENCE",
+                "US": "STANDALONE",
+            },
+        )
+        self.assertEqual(
+            int(rows.loc[("benzathine benzylpenicillin", "BD"), "standalone_product_count"]),
+            1,
+        )
+        self.assertFalse(
+            reviewed_equivalent("benzathine benzylpenicillin", "benzylpenicillin")
+        )
+        self.assertNotEqual(
+            rows.loc[("benzathine benzylpenicillin", "BD"), "substance_id"],
+            rows.loc[("benzylpenicillin", "BD"), "substance_id"],
+        )
 
     def test_us_calcium_contrast_agent_evidence_remains_unknown(self):
         with TemporaryDirectory() as tmp:

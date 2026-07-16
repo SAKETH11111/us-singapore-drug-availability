@@ -17,6 +17,14 @@ _IDENTITY_REFINEMENTS = (
     (re.compile(r"\b(?:di[- ]?sodium\s+(?:edta|edetate)|edta\s+disodium)\b", re.I), "disodium edetate"),
     (re.compile(r"\b(?:5[- ]aminosalicylic\s+acid|mesalazine|mesalamine)\b", re.I), "mesalazine"),
     (re.compile(r"\b(?:p|para)[- ]aminosalicylic\s+acid\b", re.I), "para aminosalicylic acid"),
+    (
+        re.compile(
+            r"\b(?:benzathine\s+(?:benzyl)?penicillin|penicillin\s+g\s+benzathine|"
+            r"benzylpenicillin\s+benzathine)\b",
+            re.I,
+        ),
+        "benzathine benzylpenicillin",
+    ),
     (re.compile(r"\bbenzyl\s+benzoate\b", re.I), "benzyl benzoate"),
     (re.compile(r"\bpotassium\s+permanganate\b", re.I), "potassium permanganate"),
     (re.compile(r"\bsilver\s+diamine\s+fluoride\b", re.I), "silver diamine fluoride"),
@@ -69,6 +77,10 @@ _REVIEWED_PREFERRED_KEYS = {
     "salbutamol per puff": "salbutamol",
     "salbutamol pressurised": "salbutamol",
     "salbutamol pressurised inhaltion": "salbutamol",
+    "benzathine benzylpenicillin": "benzathine benzylpenicillin",
+    "benzathine penicillin": "benzathine benzylpenicillin",
+    "penicillin g benzathine": "benzathine benzylpenicillin",
+    "benzylpenicillin benzathine": "benzathine benzylpenicillin",
 }
 
 
@@ -103,10 +115,8 @@ CURATED_CONCEPT_KEYS = frozenset(
 )
 
 
-# DGDA code 077 is the regulator's veterinary-drug sector. Exact source keys can
-# be added only after product-level human-use evidence is reviewed. The current
-# snapshot contains no such exception; an empty allowlist is deliberately safer
-# than inferring human use from a familiar ingredient, route, or brand name.
+# DGDA category 077 is the regulator's veterinary-drug sector. It is the final
+# numeric segment before the optional source-key slug, not the manufacturer code.
 BANGLADESH_REVIEWED_HUMAN_PRODUCT_KEYS = frozenset()
 
 
@@ -181,8 +191,8 @@ def is_bangladesh_veterinary_product(
     source_key = str(product_key).strip()
     if source_key in BANGLADESH_REVIEWED_HUMAN_PRODUCT_KEYS:
         return False
-    sector_text = f"{source_key} {registration_number}"
-    if re.search(r"(?:^|-)077(?:--|\b)", sector_text):
+    identifiers = (source_key, str(registration_number).strip())
+    if any(re.search(r"(?:^|-)077(?:--.*)?$", value) for value in identifiers):
         return True
     return has_veterinary_marker(*marker_values)
 
@@ -225,12 +235,19 @@ def classify_eml_scope(medicine_name: object, formulations: object) -> str:
     return ""
 
 
-def external_source_for_observation(country_code: str, target_key: str) -> str:
+def external_source_for_observation(
+    country_code: str, target_key: str, eml_section: object = ""
+) -> str:
     """Name a missing category source when the selected register cannot answer."""
 
     target = _plain(target_key)
+    section = _plain(eml_section)
     cber_biologic = bool(
-        "vaccine" in target
+        re.search(
+            r"\bsera immunoglobulins and monoclonal antibodies\b",
+            section,
+        )
+        or "vaccine" in target
         or "immune globulin" in target
         or "immunoglobulin" in target
         or re.search(r"\b(?:antiserum|antitoxin)\b", target)
@@ -456,6 +473,22 @@ def adjudicate_eml_concept_product(
 
     if target == "ferrous salt":
         if any(key.startswith("ferrous ") for key in keys):
+            if country_code == "BT" and {
+                "levonorgestrel",
+                "ethinylestradiol",
+            }.issubset(keys):
+                explicit_iron_strength = bool(
+                    re.search(
+                        r"\b(?:ferrous fumarate|iron)\b.{0,30}\b\d+(?:\.\d+)?\s*mg\b",
+                        evidence_text,
+                    )
+                )
+                if not explicit_iron_strength:
+                    return ConceptAdjudication(
+                        "INDETERMINATE",
+                        "bt_contraceptive_ferrous_salt_strength_unverified",
+                        "THERAPEUTIC_IRON_STRENGTH_CONFIRMATION",
+                    )
             if country_code == "US":
                 oral = bool(re.search(r"\boral\b|\btablet\b|\bcapsule\b", evidence_text))
                 explicit_therapeutic_elemental_dose = bool(
