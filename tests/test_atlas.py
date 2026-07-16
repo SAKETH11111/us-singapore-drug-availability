@@ -32,6 +32,7 @@ from src.atlas_adjudications import (
     canonical_reviewed_identity,
     canonicalize_atc,
     classify_eml_scope,
+    external_source_for_observation,
     refine_identity,
     reviewed_equivalent,
 )
@@ -174,7 +175,7 @@ class AtlasAdjudicationTests(unittest.TestCase):
             product_name="ORS (Oral Rehydration Salts)",
             raw_ingredient_text=(
                 "Anhydrous Glucose + Potassium Chloride + Sodium Chloride + "
-                "Trisodium Citrate"
+                "Trisodium Citrate  6.75 gm + 750 mg + 1.3 gm + 1.45 gm/500 ml"
             ),
             form="Oral Saline",
             strength="",
@@ -341,6 +342,115 @@ class AtlasAdjudicationTests(unittest.TestCase):
             ),
         )
         self.assertIsNone(hartmann_superset)
+
+    def test_insulin_subtypes_use_correct_atc_products_and_glargine_identity(self):
+        self.assertEqual(
+            canonicalize_atc(
+                "A10AB01", "INSULATARD PENFILL INJECTION 100 iu/ml"
+            ),
+            ("A10AC01", "corrected"),
+        )
+
+        expected_present = {
+            "HUMULIN R": "100 UNITS/ML",
+            "HUMULIN R PEN": "100 UNITS/ML",
+            "NOVOLIN R": "100 UNITS/ML",
+        }
+        for product_name, strength in expected_present.items():
+            with self.subTest(product_name=product_name):
+                adjudication = adjudicate_eml_concept_product(
+                    "human insulin short acting",
+                    country_code="US",
+                    product_name=product_name,
+                    raw_ingredient_text="INSULIN RECOMBINANT HUMAN",
+                    form="INJECTABLE;INJECTION",
+                    strength=strength,
+                    product_atc_codes="",
+                    ingredient_keys=frozenset({"insulin recombinant human"}),
+                )
+                self.assertIsNotNone(adjudication)
+                self.assertEqual(adjudication.state, "VERIFIED_PRESENT")
+
+        for product_name, form, strength in (
+            ("HUMULIN R KWIKPEN", "SOLUTION;SUBCUTANEOUS", "500 UNITS/ML"),
+            ("MYXREDLIN", "SOLUTION;INTRAVENOUS", "1 UNIT/ML"),
+        ):
+            with self.subTest(product_name=product_name):
+                self.assertIsNone(
+                    adjudicate_eml_concept_product(
+                        "human insulin short acting",
+                        country_code="US",
+                        product_name=product_name,
+                        raw_ingredient_text="INSULIN HUMAN",
+                        form=form,
+                        strength=strength,
+                        product_atc_codes="",
+                        ingredient_keys=frozenset({"insulin human"}),
+                    )
+                )
+
+        self.assertEqual(
+            refine_identity(
+                "Insulin Glargine Impact 100 units/ml (Recombinant)",
+                "insulin glargine impact",
+            ),
+            "insulin glargine",
+        )
+
+    def test_ors_products_are_graded_exact_related_or_requires_verification(self):
+        cases = {
+            (
+                "Anhydrous Glucose + Potassium Chloride + Sodium Chloride + "
+                "Trisodium Citrate  6.75 gm + 750 mg + 1.3 gm + 1.45 gm/500 ml"
+            ): ("VERIFIED_PRESENT", "reviewed_ors_current_reduced_osmolarity"),
+            (
+                "Dextrose Anhydrous + Potassium Chloride + Sodium Chloride + "
+                "Trisodium Citrate  20 gm + 1.5 gm + 3.5 gm + 2.9 gm/Litres"
+            ): ("INDETERMINATE", "reviewed_ors_related_non_exact"),
+            (
+                "Dextrose Anhydrous + Potassium Chloride + Sodium Chloride + "
+                "Trisodium Citrate  10 gm + 750 gm + 1.75 gm + 1.45 gm/500 ml"
+            ): ("INDETERMINATE", "reviewed_ors_composition_requires_verification"),
+        }
+        keys = frozenset(
+            {
+                "dextrose",
+                "potassium chloride",
+                "sodium chloride",
+                "trisodium citrate",
+            }
+        )
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                adjudication = adjudicate_eml_concept_product(
+                    "oral rehydration salts",
+                    country_code="BD",
+                    product_name="Brac Saline",
+                    raw_ingredient_text=raw,
+                    form="Oral Saline",
+                    strength="",
+                    product_atc_codes="",
+                    ingredient_keys=keys,
+                )
+                self.assertIsNotNone(adjudication)
+                self.assertEqual(
+                    (adjudication.state, adjudication.rule), expected
+                )
+
+    def test_us_cber_biologic_categories_require_the_missing_category_source(self):
+        for concept in (
+            "BCG vaccine",
+            "anti-rabies immunoglobulin",
+            "coagulation factor VIII",
+            "coagulation factor IX",
+            "tuberculin purified protein derivative",
+        ):
+            with self.subTest(concept=concept):
+                self.assertEqual(
+                    external_source_for_observation("US", concept),
+                    "FDA_CBER_OR_PURPLE_BOOK",
+                )
+        self.assertEqual(external_source_for_observation("US", "metformin"), "")
 
 
 def write_tsv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -654,6 +764,64 @@ def write_fixture_sources(root: Path) -> None:
         ],
     )
     write_legacy_reference_inputs(root)
+
+
+def append_fda_fixture_product(
+    root: Path,
+    *,
+    appl_no: str,
+    product_no: str,
+    drug_name: str,
+    active_ingredient: str,
+    form: str,
+    strength: str,
+    marketing_status_id: str = "1",
+) -> None:
+    """Append one internally consistent Drugs@FDA fixture observation."""
+
+    fda = root / "data" / "raw" / "fda"
+    applications = pd.read_csv(fda / "Applications.txt", sep="\t", dtype=str)
+    applications.loc[len(applications)] = {
+        "ApplNo": appl_no,
+        "ApplType": "NDA",
+        "SponsorName": "Regression Fixture",
+    }
+    applications.to_csv(fda / "Applications.txt", sep="\t", index=False)
+
+    products = pd.read_csv(fda / "Products.txt", sep="\t", dtype=str)
+    products.loc[len(products)] = {
+        "ApplNo": appl_no,
+        "ProductNo": product_no,
+        "Form": form,
+        "Strength": strength,
+        "ReferenceDrug": "1",
+        "DrugName": drug_name,
+        "ActiveIngredient": active_ingredient,
+        "ReferenceStandard": "1",
+    }
+    products.to_csv(fda / "Products.txt", sep="\t", index=False)
+
+    submissions = pd.read_csv(fda / "Submissions.txt", sep="\t", dtype=str)
+    submissions.loc[len(submissions)] = {
+        "ApplNo": appl_no,
+        "SubmissionClassCodeID": "",
+        "SubmissionType": "ORIG",
+        "SubmissionNo": "1",
+        "SubmissionStatus": "AP",
+        "SubmissionStatusDate": "2003-01-01",
+        "SubmissionsPublicNotes": "",
+        "ReviewPriority": "",
+        "InActivateDate": "",
+    }
+    submissions.to_csv(fda / "Submissions.txt", sep="\t", index=False)
+
+    marketing = pd.read_csv(fda / "MarketingStatus.txt", sep="\t", dtype=str)
+    marketing.loc[len(marketing)] = {
+        "MarketingStatusID": marketing_status_id,
+        "ApplNo": appl_no,
+        "ProductNo": product_no,
+    }
+    marketing.to_csv(fda / "MarketingStatus.txt", sep="\t", index=False)
 
 
 class CountryAdapterContractTests(unittest.TestCase):
@@ -1058,6 +1226,80 @@ class CountryAdapterContractTests(unittest.TestCase):
             {"vet-name", "vet-metadata", "vet-brand", "vet-bolus"},
         )
 
+    def test_bangladesh_077_veterinary_sector_excludes_unmarked_products(self):
+        concepts = [
+            {
+                "id": "328-0022-077--chlortrimed",
+                "display_name": "Chlortrimed",
+                "retired": False,
+                "extras": {
+                    "dar_number": "328-0022-077",
+                    "trade_name": "Chlortrimed",
+                    "generic_content_raw": "Chlortetracycline 20 gm/100 gm",
+                    "dosage_form": "Powder",
+                    "company": "Sector fixture",
+                    "dar_quality_flag": "",
+                },
+            },
+            {
+                "id": "327-0025-077--niclemet",
+                "display_name": "Niclemet",
+                "retired": False,
+                "extras": {
+                    "dar_number": "327-0025-077",
+                    "trade_name": "Niclemet",
+                    "generic_content_raw": (
+                        "Levamisole + Metoclopramide + Niclosamide "
+                        "50 mg + 2.5 mg + 450 mg"
+                    ),
+                    "dosage_form": "Tablet",
+                    "company": "Sector fixture",
+                    "dar_quality_flag": "",
+                },
+            },
+            {
+                "id": "100-0002-001--paracetamol",
+                "display_name": "Paracetamol",
+                "retired": False,
+                "extras": {
+                    "dar_number": "100-0002-001",
+                    "trade_name": "Paracetamol",
+                    "generic_content_raw": "Paracetamol 500 mg",
+                    "dosage_form": "Tablet",
+                    "company": "Human fixture",
+                    "dar_quality_flag": "",
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "bd"
+            raw.mkdir()
+            (raw / "dgda_concepts.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"num_found": len(concepts)},
+                        "concepts": concepts,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            batch = BangladeshAdapter().stage(raw, EXTRACTION_DATE)
+
+        products = batch.products.set_index("source_product_key")
+        for product_key in (
+            "328-0022-077--chlortrimed",
+            "327-0025-077--niclemet",
+        ):
+            with self.subTest(product_key=product_key):
+                self.assertFalse(bool(products.loc[product_key, "included_in_presence"]))
+                self.assertEqual(
+                    products.loc[product_key, "exclusion_reason"],
+                    "outside_human_scope_veterinary",
+                )
+        self.assertTrue(
+            bool(products.loc["100-0002-001--paracetamol", "included_in_presence"])
+        )
+
     def test_bangladesh_missing_generic_is_unresolved_not_brand_identity(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1123,6 +1365,71 @@ class CountryAdapterContractTests(unittest.TestCase):
         )
         self.assertEqual(products.loc["BHU-DRA/23/RN/H159", "product_name"], "OPTIVIEW Lubricant Eye Drop")
         self.assertIn("generic_brand_fields_swapped", set(batch.issues["issue_code"]))
+
+    def test_bhutan_adapter_decomposes_and_with_multi_active_products(self):
+        additions = [
+            (
+                "BHU-MPD/25/RN/H235",
+                "Diclofenac Sodium with Paracetamol Tablets",
+                "Vivian PLUS",
+                {"diclofenac", "paracetamol"},
+            ),
+            (
+                "BHU-DRA/23/H155",
+                "Linagliptin INN 2.5 mg and Metformin HCl BP 850 mg",
+                "Adlinameg 2.5/850",
+                {"linagliptin", "metformin"},
+            ),
+            (
+                "BHU-MPD/24/CR/H027",
+                "Iron with Folic Acid",
+                "Feofol",
+                {"iron", "folic acid"},
+            ),
+            (
+                "BHU-MPD/25/ER/H312",
+                "Intravenous Fat Emulsion with Medium and Long Chain "
+                "Triglycerides (20% w/v)",
+                "CELEPIDMCT-LCT 20%",
+                {"fat", "medium and long chain triglycerides"},
+            ),
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            path = root / "data" / "raw" / "bt" / "registered_products.csv"
+            products = pd.read_csv(path, dtype=str).fillna("")
+            for ordinal, (registration, generic, brand, _) in enumerate(
+                additions, start=6
+            ):
+                products.loc[len(products)] = {
+                    "Sr. No": str(ordinal),
+                    "Reg_No": registration,
+                    "Generic_Name": generic,
+                    "BrandName": brand,
+                    "Therapeutic Category": "Regression fixture",
+                    "MAH": "BT Holder",
+                    "Packsize": "fixture",
+                    "Product_validity": "2028-12-31",
+                    "Manufacture": "BT Maker",
+                }
+            products.to_csv(path, index=False)
+            batch = BhutanAdapter().stage(path.parent, EXTRACTION_DATE)
+
+        staged_products = batch.products.set_index("source_product_key")
+        for registration, _, _, expected in additions:
+            with self.subTest(registration=registration):
+                actual = set(
+                    batch.ingredients.loc[
+                        batch.ingredients["source_product_key"].eq(registration),
+                        "normalized_ingredient_key",
+                    ]
+                )
+                self.assertEqual(actual, expected)
+                self.assertEqual(
+                    int(staged_products.loc[registration, "ingredient_component_count"]),
+                    2,
+                )
 
     def test_bhutan_current_qualification_requires_actions_snapshot(self):
         with TemporaryDirectory() as tmp:
@@ -1219,7 +1526,8 @@ class AtlasBuildTests(unittest.TestCase):
                 (
                     "bd-ors",
                     "ORS (Oral Rehydration Salts)",
-                    "Anhydrous Glucose + Potassium Chloride + Sodium Chloride + Trisodium Citrate",
+                    "Anhydrous Glucose + Potassium Chloride + Sodium Chloride + "
+                    "Trisodium Citrate  6.75 gm + 750 mg + 1.3 gm + 1.45 gm/500 ml",
                     "Oral Saline",
                 ),
                 ("bd-pancreatin", "Pancreon 10000", "Pancreatin 150 mg", "Capsule"),
@@ -1300,6 +1608,34 @@ class AtlasBuildTests(unittest.TestCase):
             "VERIFIED_PRESENT",
         )
         self.assertNotIn(("all trans retinoic acid", "BD"), by_target_country.index)
+
+    def test_eml_section_heading_pointer_is_excluded_from_medicine_universe(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            eeml_path = root / "data" / "raw" / "who" / "eeml_2025.csv"
+            eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
+            eeml.loc[len(eeml)] = {
+                "Medicine name": "Medicines for COVID-19",
+                "EML section": "Medicines for COVID-19",
+                "Formulations": "Refer to WHO living guidelines",
+                "Indication": "COVID-19",
+                "ATC codes": "",
+                "Combined with": "",
+                "Status": "Added",
+            }
+            eeml.to_csv(eeml_path, index=False)
+
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+            entries = pd.read_csv(
+                artifact.table_paths["essential_medicine_entries"], dtype=str
+            ).fillna("")
+            substances = pd.read_csv(
+                artifact.table_paths["substances"], dtype=str
+            ).fillna("")
+
+        self.assertNotIn("Medicines for COVID-19", set(entries["medicine_name"]))
+        self.assertNotIn("medicines covid", set(substances["preferred_name"]))
 
     def test_build_preserves_raw_eml_atc_and_emits_canonical_codes_with_issues(self):
         with TemporaryDirectory() as tmp:
@@ -1671,6 +2007,102 @@ class AtlasBuildTests(unittest.TestCase):
 
 
 class ComparisonQueryTests(unittest.TestCase):
+    def test_us_ferrous_salt_nontherapeutic_evidence_remains_unknown(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            for product in (
+                {
+                    "appl_no": "4",
+                    "product_no": "001",
+                    "drug_name": "FERROUS CITRATE FE-59",
+                    "active_ingredient": "FERROUS CITRATE FE-59",
+                    "form": "INJECTABLE;INJECTION",
+                    "strength": "25 MICROCURIES/ML",
+                    "marketing_status_id": "3",
+                },
+                {
+                    "appl_no": "5",
+                    "product_no": "001",
+                    "drug_name": "FERROUS FUMARATE",
+                    "active_ingredient": "FERROUS FUMARATE",
+                    "form": "TABLET;ORAL",
+                    "strength": "75MG",
+                },
+                {
+                    "appl_no": "6",
+                    "product_no": "001",
+                    "drug_name": "NORMINEST FE",
+                    "active_ingredient": (
+                        "ETHINYL ESTRADIOL;NORETHINDRONE;FERROUS FUMARATE"
+                    ),
+                    "form": "TABLET;ORAL-28",
+                    "strength": "0.035MG;0.5MG;75MG",
+                },
+            ):
+                append_fda_fixture_product(root, **product)
+            eeml_path = root / "data" / "raw" / "who" / "eeml_2025.csv"
+            eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
+            eeml.loc[len(eeml)] = {
+                "Medicine name": "ferrous salt",
+                "EML section": "Medicines affecting the blood",
+                "Formulations": "Oral solid dosage form: equivalent to 60 mg iron",
+                "Indication": "Iron deficiency anaemia",
+                "ATC codes": "B03AA",
+                "Combined with": "",
+                "Status": "Added",
+            }
+            eeml.to_csv(eeml_path, index=False)
+
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+            result = compare_atlas(artifact.database_path, ("US",))
+
+        row = result.long.set_index("preferred_name").loc["ferrous salt"]
+        self.assertEqual(row["observation"], "UNKNOWN")
+        self.assertEqual(row["current_marketing"], "UNKNOWN")
+        self.assertEqual(
+            row["needs_external_source"], "FDA_OTC_OR_SUPPLEMENT_SOURCE"
+        )
+        self.assertEqual(int(row["standalone_product_count"]), 0)
+        self.assertEqual(int(row["combo_product_count"]), 0)
+
+    def test_us_calcium_contrast_agent_evidence_remains_unknown(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            append_fda_fixture_product(
+                root,
+                appl_no="4",
+                product_no="001",
+                drug_name="ISOPAQUE 280",
+                active_ingredient="CALCIUM; MEGLUMINE; METRIZOIC ACID",
+                form="INJECTABLE;INJECTION",
+                strength="0.35MG/ML;140.1MG/ML;461.8MG/ML",
+                marketing_status_id="3",
+            )
+            eeml_path = root / "data" / "raw" / "who" / "eeml_2025.csv"
+            eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
+            eeml.loc[len(eeml)] = {
+                "Medicine name": "calcium",
+                "EML section": "Vitamins and minerals",
+                "Formulations": "Oral solid dosage form: 500 mg elemental calcium",
+                "Indication": "",
+                "ATC codes": "A12AA",
+                "Combined with": "",
+                "Status": "Added",
+            }
+            eeml.to_csv(eeml_path, index=False)
+
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+            result = compare_atlas(artifact.database_path, ("US",))
+
+        row = result.long.set_index("preferred_name").loc["calcium"]
+        self.assertEqual(row["observation"], "UNKNOWN")
+        self.assertEqual(row["uncertainty_reason"], "concept_evidence_indeterminate")
+        self.assertEqual(row["current_marketing"], "UNKNOWN")
+        self.assertEqual(int(row["standalone_product_count"]), 0)
+        self.assertEqual(int(row["combo_product_count"]), 0)
+
     def test_comparison_separates_snapshot_presence_scope_and_current_status(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1678,8 +2110,9 @@ class ComparisonQueryTests(unittest.TestCase):
 
             bd_path = root / "data" / "raw" / "bd" / "dgda_concepts.json"
             payload = json.loads(bd_path.read_text(encoding="utf-8"))
-            payload["concepts"].append(
-                {
+            payload["concepts"].extend(
+                [
+                    {
                     "id": "bd-moxidectin-vet",
                     "display_name": "Longtin Vet Inj",
                     "retired": False,
@@ -1688,7 +2121,32 @@ class ComparisonQueryTests(unittest.TestCase):
                         "generic_content_raw": "Moxidectin  1 gm/100 ml",
                         "dosage_form": "Injection",
                     },
-                }
+                    },
+                    {
+                        "id": "bd-human-benzylpenicillin",
+                        "display_name": "Benzylpenicillin",
+                        "retired": False,
+                        "extras": {
+                            "dar_number": "100-0003-001",
+                            "trade_name": "Benzylpenicillin",
+                            "generic_content_raw": "Benzylpenicillin 1 gm",
+                            "dosage_form": "Injection",
+                        },
+                    },
+                    {
+                        "id": "002-0170-077--streptopen",
+                        "display_name": "Streptopen",
+                        "retired": False,
+                        "extras": {
+                            "dar_number": "002-0170-077",
+                            "trade_name": "Streptopen",
+                            "generic_content_raw": (
+                                "Procaine Benzylpenicillin + Streptomycin"
+                            ),
+                            "dosage_form": "Injection",
+                        },
+                    },
+                ]
             )
             payload["metadata"]["num_found"] = len(payload["concepts"])
             payload["metadata"]["num_returned"] = len(payload["concepts"])
@@ -1696,7 +2154,12 @@ class ComparisonQueryTests(unittest.TestCase):
 
             eeml_path = root / "data" / "raw" / "who" / "eeml_2025.csv"
             eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
-            for medicine_name in ("moxidectin", "BCG vaccine", "whole blood"):
+            for medicine_name in (
+                "moxidectin",
+                "procaine benzylpenicillin",
+                "BCG vaccine",
+                "whole blood",
+            ):
                 eeml.loc[len(eeml)] = {
                     "Medicine name": medicine_name,
                     "EML section": "Comparison fixture",
@@ -1720,6 +2183,11 @@ class ComparisonQueryTests(unittest.TestCase):
         self.assertIn("only a veterinary product was observed", vet_only["evidence_note"])
         self.assertIn("no human-scope product was found", vet_only["evidence_note"])
         self.assertIn("Longtin Vet Inj", vet_only["evidence_note"])
+
+        vet_only_pen = rows.loc[("procaine benzylpenicillin", "BD")]
+        self.assertEqual(vet_only_pen["observation"], "OBSERVED_ABSENCE")
+        self.assertIn("only a veterinary product was observed", vet_only_pen["evidence_note"])
+        self.assertIn("Streptopen", vet_only_pen["evidence_note"])
 
         us_vaccine = rows.loc[("bcg vaccine", "US")]
         self.assertEqual(us_vaccine["observation"], "UNKNOWN")

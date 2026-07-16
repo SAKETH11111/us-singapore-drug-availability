@@ -26,6 +26,15 @@ _IDENTITY_REFINEMENTS = (
     (re.compile(r"\binsulin\s*\(\s*human\s*,\s*intermediate[- ]acting\s*\)", re.I), "human insulin intermediate acting"),
     (re.compile(r"\binsulin\s*\(\s*analogue\s*,\s*rapid[- ]acting\s*\)", re.I), "insulin analogue rapid acting"),
     (re.compile(r"\binsulin\s*\(\s*analogue\s*,\s*long[- ]acting\s*\)", re.I), "insulin analogue long acting"),
+    (re.compile(r"\binsulin\s+glargine\s+impact\b", re.I), "insulin glargine"),
+    (
+        re.compile(
+            r"\b(?:liquid\s+medical\s+oxygen|medical\s+oxygen(?:\s+compressed)?|"
+            r"compressed\s+(?:medical|breathing)\s+oxygen|oxygenium)\b",
+            re.I,
+        ),
+        "oxygen",
+    ),
 )
 
 
@@ -55,6 +64,11 @@ _REVIEWED_PREFERRED_KEYS = {
     "adrenaline": "adrenaline",
     "l noradrenaline": "noradrenaline",
     "noradrenaline": "noradrenaline",
+    "noradrenaline concentrate": "noradrenaline",
+    "salbutamol inhalant": "salbutamol",
+    "salbutamol per puff": "salbutamol",
+    "salbutamol pressurised": "salbutamol",
+    "salbutamol pressurised inhaltion": "salbutamol",
 }
 
 
@@ -72,6 +86,7 @@ CURATED_CONCEPT_KEYS = frozenset(
         "typhoid vaccine",
         "varicella vaccine",
         "oral rehydration salts",
+        "calcium",
         "compound sodium lactate",
         "human insulin short acting",
         "human insulin intermediate acting",
@@ -80,9 +95,19 @@ CURATED_CONCEPT_KEYS = frozenset(
         "pancreatic enzymes",
         "erythropoiesis stimulating agents",
         "ferrous salt",
+        "anti d immunoglobulin",
+        "anti rabies immunoglobulin",
+        "anti tetanus immunoglobulin",
         "all trans retinoic acid",
     }
 )
+
+
+# DGDA code 077 is the regulator's veterinary-drug sector. Exact source keys can
+# be added only after product-level human-use evidence is reviewed. The current
+# snapshot contains no such exception; an empty allowlist is deliberately safer
+# than inferring human use from a familiar ingredient, route, or brand name.
+BANGLADESH_REVIEWED_HUMAN_PRODUCT_KEYS = frozenset()
 
 
 @dataclass(frozen=True)
@@ -146,6 +171,22 @@ def has_veterinary_marker(*values: object) -> bool:
     )
 
 
+def is_bangladesh_veterinary_product(
+    product_key: object,
+    registration_number: object,
+    *marker_values: object,
+) -> bool:
+    """Use the DGDA veterinary sector before falling back to name markers."""
+
+    source_key = str(product_key).strip()
+    if source_key in BANGLADESH_REVIEWED_HUMAN_PRODUCT_KEYS:
+        return False
+    sector_text = f"{source_key} {registration_number}"
+    if re.search(r"(?:^|-)077(?:--|\b)", sector_text):
+        return True
+    return has_veterinary_marker(*marker_values)
+
+
 def aggregate_current_marketing(values: object) -> str:
     """Aggregate FDA marketing status without turning unknown support into certainty."""
 
@@ -188,12 +229,18 @@ def external_source_for_observation(country_code: str, target_key: str) -> str:
     """Name a missing category source when the selected register cannot answer."""
 
     target = _plain(target_key)
-    if country_code == "US" and (
+    cber_biologic = bool(
         "vaccine" in target
         or "immune globulin" in target
         or "immunoglobulin" in target
         or re.search(r"\b(?:antiserum|antitoxin)\b", target)
-    ):
+        or re.search(r"\b(?:coagulation\s+)?factor\s+(?:viii|ix)\b", target)
+        or re.search(
+            r"\btuberculin\b.*\b(?:purified\s+protein\s+derivative|ppd)\b",
+            target,
+        )
+    )
+    if country_code == "US" and cber_biologic:
         return "FDA_CBER_OR_PURPLE_BOOK"
     return ""
 
@@ -251,11 +298,50 @@ def adjudicate_eml_concept_product(
         required = {"potassium chloride", "sodium chloride"}
         carbohydrate = {"glucose", "anhydrous glucose", "dextrose", "dextrose anhydrous"}
         citrate = {"trisodium citrate", "sodium citrate"}
-        exact_name = "oral rehydration salts" in evidence_text
         exact_set = required.issubset(keys) and bool(keys & carbohydrate) and bool(keys & citrate)
-        if (exact_name or exact_set) and re.search(r"\boral\b|\bors\b", evidence_text):
+        oral = bool(re.search(r"\boral\b|\bors\b|\bsaline\b", evidence_text))
+        quantities = unicodedata.normalize(
+            "NFKC", f"{raw_ingredient_text} {strength}"
+        ).casefold()
+        quantities = re.sub(r"\s+", " ", quantities)
+        exact_reduced = bool(
+            re.search(
+                r"\b6\.75\s*g(?:m)?\b.*\b750\s*mg\b.*\b1\.3\s*g(?:m)?\b.*"
+                r"\b1\.45\s*g(?:m)?\b",
+                quantities,
+            )
+            or re.search(
+                r"\b13\.5\s*g(?:m)?\b.*\b1\.5\s*g(?:m)?\b.*\b2\.6\s*g(?:m)?\b.*"
+                r"\b2\.9\s*g(?:m)?\b",
+                quantities,
+            )
+        )
+        older_composition = bool(
+            re.search(
+                r"\b10\s*g(?:m)?\b.*\b750\s*mg\b.*\b1\.75\s*g(?:m)?\b.*"
+                r"\b1\.45\s*g(?:m)?\b",
+                quantities,
+            )
+            or re.search(
+                r"\b20\s*g(?:m)?\b.*\b1\.5\s*g(?:m)?\b.*\b3\.5\s*g(?:m)?\b.*"
+                r"\b2\.9\s*g(?:m)?\b",
+                quantities,
+            )
+        )
+        if exact_set and oral and exact_reduced:
             return ConceptAdjudication(
-                "VERIFIED_PRESENT", "reviewed_ors_composition", mode_override="STANDALONE"
+                "VERIFIED_PRESENT",
+                "reviewed_ors_current_reduced_osmolarity",
+                mode_override="STANDALONE",
+            )
+        if exact_set and oral and older_composition:
+            return ConceptAdjudication(
+                "INDETERMINATE", "reviewed_ors_related_non_exact"
+            )
+        if exact_set and oral:
+            return ConceptAdjudication(
+                "INDETERMINATE",
+                "reviewed_ors_composition_requires_verification",
             )
         return None
 
@@ -295,9 +381,25 @@ def adjudicate_eml_concept_product(
             re.search(r"\b(?:actrapid|humulin r|novolin r|myxredlin|regular insulin|soluble insulin)\b", evidence_text)
         )
         excluded = bool(re.search(r"\b(?:mix|protamine|isophane|nph)\b", evidence_text))
-        human_insulin = "insulin human" in keys or bool(
-            re.search(r"\b(?:insulin human|human insulin)\b", raw)
+        human_insulin = bool(keys & {"insulin human", "insulin recombinant human"}) or bool(
+            re.search(
+                r"\b(?:insulin human|human insulin|insulin recombinant human)\b",
+                raw,
+            )
         )
+        if country_code == "US":
+            direct_100_unit_regular = bool(
+                re.search(r"\b(?:humulin r(?: pen)?|novolin r)\b", product)
+                and re.search(
+                    r"(?<!\d)100\s*(?:units?|u|iu)\s+ml(?!\d)",
+                    strength_text,
+                )
+            )
+            if human_insulin and direct_100_unit_regular:
+                return ConceptAdjudication(
+                    "VERIFIED_PRESENT", "reviewed_human_insulin_short"
+                )
+            return None
         if any(atc.startswith("A10AB01") for atc in atc_values) or (
             human_insulin and short_marker and not excluded
         ):
@@ -354,7 +456,55 @@ def adjudicate_eml_concept_product(
 
     if target == "ferrous salt":
         if any(key.startswith("ferrous ") for key in keys):
+            if country_code == "US":
+                oral = bool(re.search(r"\boral\b|\btablet\b|\bcapsule\b", evidence_text))
+                explicit_therapeutic_elemental_dose = bool(
+                    re.search(
+                        r"\b(?:elemental\s+)?iron\b.{0,30}\b(?:60|65)\s*mg\b",
+                        evidence_text,
+                    )
+                )
+                if oral and len(keys) == 1 and explicit_therapeutic_elemental_dose:
+                    return ConceptAdjudication(
+                        "VERIFIED_PRESENT", "reviewed_ferrous_salt_therapeutic_oral"
+                    )
+                return ConceptAdjudication(
+                    "INDETERMINATE",
+                    "us_ferrous_salt_nontherapeutic_or_unverified",
+                    "FDA_OTC_OR_SUPPLEMENT_SOURCE",
+                )
             return ConceptAdjudication("VERIFIED_PRESENT", "reviewed_ferrous_salt_class_member")
+        return None
+
+    if target == "calcium" and country_code == "US" and "calcium" in keys:
+        oral = bool(re.search(r"\boral\b|\btablet\b|\bcapsule\b", evidence_text))
+        exact_elemental_dose = bool(
+            re.search(r"\b500\s*mg\b.{0,20}\belemental\s+calcium\b", evidence_text)
+            or re.search(r"\belemental\s+calcium\b.{0,20}\b500\s*mg\b", evidence_text)
+        )
+        if oral and exact_elemental_dose:
+            return ConceptAdjudication(
+                "VERIFIED_PRESENT", "reviewed_calcium_500mg_elemental_oral"
+            )
+        return ConceptAdjudication(
+            "INDETERMINATE", "us_calcium_formulation_indeterminate"
+        )
+
+    immunoglobulin_rules = {
+        "anti d immunoglobulin": r"\b(?:rho d|rho immune|hyperrho)\b",
+        "anti rabies immunoglobulin": r"\b(?:rabies immunoglobulin|rabies immune globulin|hyperrab)\b",
+        "anti tetanus immunoglobulin": r"\b(?:tetanus immunoglobulin|tetanus immune globulin|antitetanus immunoglobulin|hypertet)\b",
+    }
+    if target in immunoglobulin_rules:
+        human = bool(
+            re.search(r"\b(?:human|hyperrho|hyperrab|hypertet)\b", evidence_text)
+        )
+        if human and re.search(immunoglobulin_rules[target], evidence_text):
+            return ConceptAdjudication(
+                "VERIFIED_PRESENT",
+                "reviewed_human_immunoglobulin_product",
+                mode_override="STANDALONE",
+            )
         return None
 
     if target == "all trans retinoic acid":
@@ -375,7 +525,11 @@ def canonicalize_atc(value: object, medicine_name: object = "") -> tuple[str, st
         return "", "blank"
     cleaned = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069\s]", "", raw).upper()
     corrected = cleaned != raw.upper()
-    if _plain(medicine_name) == "insulin human short acting" and cleaned == "A10AC01":
+    medicine = _plain(medicine_name)
+    if "insulatard" in medicine and cleaned == "A10AB01":
+        cleaned = "A10AC01"
+        corrected = True
+    elif medicine == "insulin human short acting" and cleaned == "A10AC01":
         cleaned = "A10AB01"
         corrected = True
     mapped = _ATC_CORRECTIONS.get(cleaned, cleaned)

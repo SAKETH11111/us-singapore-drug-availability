@@ -35,7 +35,7 @@ from .atlas_adjudications import (
     canonicalize_atc,
     classify_eml_scope,
     external_source_for_observation,
-    has_veterinary_marker,
+    is_bangladesh_veterinary_product,
     refine_identity,
 )
 from .normalize import (
@@ -513,7 +513,9 @@ class HsaAdapter:
             raw_product_atc = str(getattr(row, "atc_code", "")).strip()
             product_atc_values: list[str] = []
             for raw_atc_component in re.split(r"&&|[|;,]", raw_product_atc):
-                product_atc, atc_state = canonicalize_atc(raw_atc_component)
+                product_atc, atc_state = canonicalize_atc(
+                    raw_atc_component, row.product_name
+                )
                 if product_atc and product_atc not in product_atc_values:
                     product_atc_values.append(product_atc)
                 if atc_state in {"invalid", "corrected"}:
@@ -674,7 +676,9 @@ class BangladeshAdapter:
                 extras.get("trade_name") or concept.get("display_name") or ""
             )
             dosage_form = str(extras.get("dosage_form") or "")
-            veterinary = has_veterinary_marker(
+            veterinary = is_bangladesh_veterinary_product(
+                product_key,
+                extras.get("dar_number"),
                 product_name,
                 raw_text,
                 dosage_form,
@@ -845,7 +849,7 @@ class BhutanAdapter:
                 action_ingredient_text = str(row.get("Generic ", "") or row.get("Generic", ""))
                 action_ingredients = frozenset(
                     normalized
-                    for _, normalized in _split_south_asia_ingredients(action_ingredient_text)
+                    for _, normalized in _split_bhutan_ingredients(action_ingredient_text)
                 )
                 previous = action_for.get(registration_key)
                 if previous is None or action_date > previous[0]:
@@ -860,14 +864,14 @@ class BhutanAdapter:
             declared_generic = str(row["Generic_Name"]).strip()
             declared_brand = str(row["BrandName"]).strip()
             raw_text = _select_bhutan_generic_text(declared_generic, declared_brand)
-            raw_components = _south_asia_raw_components(raw_text)
+            raw_components = _bhutan_raw_components(raw_text)
             fields_swapped = (
                 bool(declared_generic)
                 and raw_text == declared_brand
                 and raw_text != declared_generic
             )
             product_name = declared_generic if fields_swapped else declared_brand
-            pairs = _split_south_asia_ingredients(raw_text)
+            pairs = _split_bhutan_ingredients(raw_text)
             unresolved_component_count = max(len(raw_components) - len(pairs), 0)
             product_ingredient_set = frozenset(normalized for _, normalized in pairs)
             validity = row["_validity"]
@@ -1133,6 +1137,9 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
     if unknown_statuses:
         raise ValueError(f"eEML contains unknown status values: {unknown_statuses}")
     active_eeml = eeml[eeml["Status"].str.strip().str.casefold().eq("added")].copy()
+    active_eeml = active_eeml[
+        ~active_eeml.apply(_is_eeml_heading_or_pointer, axis=1)
+    ].copy()
     if active_eeml.empty:
         raise ValueError("eEML snapshot has no Status=Added recommendation rows")
     active_eeml["normalized_ingredient_key"] = active_eeml["Medicine name"].map(
@@ -1444,9 +1451,18 @@ def compare_atlas(
             WHERE rp.country_code IN ({placeholders})
               AND rp.included_in_presence = 1
               AND ss.snapshot_status = 'accepted'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM eml_product_adjudications AS hold
+                  WHERE hold.universe_id = ?
+                    AND hold.country_code = rp.country_code
+                    AND hold.target_substance_id = pi.substance_id
+                    AND hold.product_id = rp.product_id
+                    AND hold.decision_state = 'INDETERMINATE'
+              )
             """,
             connection,
-            params=selected,
+            params=(*selected, universe_id),
         )
         curated_observations = pd.read_sql_query(
             f"""
@@ -2087,6 +2103,36 @@ def _split_south_asia_ingredients(value: object) -> list[tuple[str, str]]:
     return result
 
 
+def _bhutan_raw_components(value: object) -> list[str]:
+    """Split Bhutan's declared multi-active connectors before strength trimming."""
+
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return []
+    components: list[str] = []
+    with_parts = re.split(r"\s+(?i:with)\s+(?=[A-Za-z])", text)
+    for with_part in with_parts:
+        if re.search(
+            r"\bmedium\s+and\s+long\s+chain\s+triglycerides\b",
+            with_part,
+            re.I,
+        ):
+            components.append(with_part.strip())
+            continue
+        for part in re.split(r"\s+(?i:and)\s+(?=[A-Za-z])", with_part):
+            components.extend(_south_asia_raw_components(part))
+    return components
+
+
+def _split_bhutan_ingredients(value: object) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    for raw in _bhutan_raw_components(value):
+        normalized = _normalize_south_asia_component(raw)
+        if len(normalized) >= 3 and _has_ingredient_signal(normalized):
+            result.append((raw, normalized))
+    return result
+
+
 def _south_asia_raw_components(value: object) -> list[str]:
     text = "" if value is None else str(value).strip()
     if not text:
@@ -2286,6 +2332,19 @@ def _eeml_medicine_components(value: object) -> list[str]:
         if len(normalized) >= 3 and normalized not in components:
             components.append(normalized)
     return components
+
+
+def _is_eeml_heading_or_pointer(row: pd.Series) -> bool:
+    """Exclude eEML section/pointer objects that are not medicine identities."""
+
+    medicine_name = _canonical_eeml_cell(row.get("Medicine name", "")).casefold()
+    section = _canonical_eeml_cell(row.get("EML section", "")).casefold()
+    formulations = _canonical_eeml_cell(row.get("Formulations", "")).casefold()
+    return bool(
+        medicine_name
+        and medicine_name == section
+        and re.search(r"\b(?:refer|see)\b.*\b(?:guidelines?|recommendations?)\b", formulations)
+    )
 
 
 def _build_legacy_observations(regulator_raw_root: Path) -> pd.DataFrame:
@@ -4145,6 +4204,14 @@ def _identity_uncertainty_relation(target_key: str, candidate_key: str) -> str:
     """
 
     if target_key == candidate_key:
+        return ""
+    if target_key == "sodium calcium edetate" and candidate_key == "calcium":
+        return ""
+    if (
+        target_key
+        in {"benzathine benzylpenicillin", "procaine benzylpenicillin"}
+        and candidate_key == "benzylpenicillin"
+    ):
         return ""
     target_tokens = _identity_tokens(target_key)
     candidate_tokens = _identity_tokens(candidate_key)
