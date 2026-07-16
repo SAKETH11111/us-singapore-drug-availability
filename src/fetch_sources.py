@@ -22,8 +22,16 @@ from pathlib import Path
 
 import pandas as pd
 
+from .sources import (
+    EEML_URL,
+    FDA_DRUGS_URL as FDA_URL,
+    FDA_RARE_LICENSE,
+    FDA_RARE_URL,
+    SUPPORTED_COUNTRIES,
+    WHO_ATC_LICENSE,
+)
 
-FDA_URL = "https://www.fda.gov/media/89850/download"
+
 HSA_RESOURCE_ID = "d_767279312753558cbf19d48344577084"
 HSA_DATA_URL = "https://data.gov.sg/api/action/datastore_search"
 HSA_METADATA_URL = (
@@ -42,9 +50,7 @@ BT_ACTIONS_URL = (
     "https://docs.google.com/spreadsheets/d/"
     "1DWvVvz3PgzGWyMaou-Ckw1Y4RKXBQRAVgjA9lC0INxk/export?format=csv&gid=0"
 )
-EEML_URL = "https://list.essentialmeds.org/print?format=xlsx"
 ATC_INDEX_URL = "https://atcddd.fhi.no/atc_ddd_index/"
-FDA_RARE_URL = "https://www.accessdata.fda.gov/scripts/opdlisting/oopd/"
 
 
 @dataclass(frozen=True)
@@ -57,7 +63,7 @@ class FetchArtifact:
 def fetch_sources(
     root: Path,
     extraction_date: date,
-    countries: tuple[str, ...] = ("US", "SG", "BD", "BT"),
+    countries: tuple[str, ...] = SUPPORTED_COUNTRIES,
     atc_path: Path | None = None,
     rare_drugs_path: Path | None = None,
 ) -> FetchArtifact:
@@ -87,12 +93,12 @@ def fetch_sources(
         )
     _validate_legacy_reference_inputs(atc_input, rare_drugs_input)
     selected = tuple(dict.fromkeys(code.upper() for code in countries))
-    unknown = sorted(set(selected) - {"US", "SG", "BD", "BT"})
+    unknown = sorted(set(selected) - set(SUPPORTED_COUNTRIES))
     if unknown:
         raise ValueError(f"Unsupported country codes: {', '.join(unknown)}")
 
     snapshot_name = extraction_date.isoformat()
-    if set(selected) != {"US", "SG", "BD", "BT"}:
+    if set(selected) != set(SUPPORTED_COUNTRIES):
         snapshot_name += "-" + "-".join(selected)
     snapshots = raw / "snapshots"
     snapshots.mkdir(parents=True, exist_ok=True)
@@ -110,16 +116,12 @@ def fetch_sources(
         records["WHO_ATC"] = {
             "source_url": ATC_INDEX_URL,
             "sha256": _file_sha256(staged_atc),
-            "license_name": "WHO ATC/DDD Index terms",
-            "license_url": "https://atcddd.fhi.no/copyright_disclaimer/",
-            "license_status": "human_review_required",
+            **WHO_ATC_LICENSE,
         }
         records["FDA_RARE"] = {
             "source_url": FDA_RARE_URL,
             "sha256": _file_sha256(staged_rare),
-            "license_name": "U.S. FDA public source",
-            "license_url": FDA_RARE_URL,
-            "license_status": "reviewed_public_government_source",
+            **FDA_RARE_LICENSE,
         }
         staged_artifacts.update({"WHO_ATC": staged_atc, "FDA_RARE": staged_rare})
         if "US" in selected:
@@ -146,7 +148,7 @@ def fetch_sources(
             (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"),
         )
         os.replace(staging, published)
-        if set(selected) == {"US", "SG", "BD", "BT"}:
+        if set(selected) == set(SUPPORTED_COUNTRIES):
             _replace_directory_pointer(raw / "current", published)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
@@ -531,8 +533,8 @@ def main() -> None:
     parser.add_argument(
         "--countries",
         nargs="+",
-        default=["US", "SG", "BD", "BT"],
-        choices=["US", "SG", "BD", "BT"],
+        default=list(SUPPORTED_COUNTRIES),
+        choices=list(SUPPORTED_COUNTRIES),
     )
     parser.add_argument(
         "--atc-path",

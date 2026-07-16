@@ -115,11 +115,6 @@ CURATED_CONCEPT_KEYS = frozenset(
 )
 
 
-# DGDA category 077 is the regulator's veterinary-drug sector. It is the final
-# numeric segment before the optional source-key slug, not the manufacturer code.
-BANGLADESH_REVIEWED_HUMAN_PRODUCT_KEYS = frozenset()
-
-
 @dataclass(frozen=True)
 class ConceptAdjudication:
     state: str
@@ -189,9 +184,9 @@ def is_bangladesh_veterinary_product(
     """Use the DGDA veterinary sector before falling back to name markers."""
 
     source_key = str(product_key).strip()
-    if source_key in BANGLADESH_REVIEWED_HUMAN_PRODUCT_KEYS:
-        return False
     identifiers = (source_key, str(registration_number).strip())
+    # DGDA category 077 is the regulator's veterinary-drug sector: the final numeric
+    # segment before the optional source-key slug, not the manufacturer code.
     if any(re.search(r"(?:^|-)077(?:--.*)?$", value) for value in identifiers):
         return True
     return has_veterinary_marker(*marker_values)

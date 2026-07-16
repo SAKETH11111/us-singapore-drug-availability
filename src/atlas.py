@@ -22,7 +22,7 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 from xml.etree import ElementTree
 
 import pandas as pd
@@ -58,13 +58,19 @@ from .pipeline import (
     load_rare_substance_keys,
     read_fda_table,
 )
+from .sources import (
+    EEML_URL as EEML_SOURCE_URL,
+    FDA_DRUGS_URL as FDA_SOURCE_URL,
+    FDA_RARE_LICENSE,
+    SUPPORTED_COUNTRIES,
+    WHO_ATC_LICENSE,
+)
 
 
 ATLAS_NAMESPACE = uuid.UUID("186c4a4a-a3aa-5be5-968d-ce32b54e4054")
 SCHEMA_VERSION = "5"
 SUBSTANCE_IDENTITY_VERSION = "normalized-ingredient-key-v1"
 UNIVERSE_ID = "WHO_EML_2025"
-SUPPORTED_COUNTRIES = ("US", "SG", "BD", "BT")
 MINIMUM_DECLARED_ROWS = {
     "US": 50_000,
     "SG": 5_000,
@@ -80,9 +86,9 @@ EEML_COLUMNS = [
     "Combined with",
     "Status",
 ]
-EEML_SOURCE_URL = "https://list.essentialmeds.org/print?format=xlsx"
 EEML_LICENSE_URL = "https://list.essentialmeds.org/licencing"
-FDA_SOURCE_URL = "https://www.fda.gov/media/89850/download"
+# Atlas records the human-facing provenance URLs below; the fetcher's request
+# endpoints (HSA's API, Bhutan's CSV export) differ and stay in fetch_sources.
 HSA_SOURCE_URL = (
     "https://data.gov.sg/collections/161/view"
 )
@@ -110,16 +116,8 @@ LEGACY_DEPENDENCY_LICENSES = {
         "license_url": "",
         "license_status": "internal_build_logic",
     },
-    "atc": {
-        "license_name": "WHO ATC/DDD Index terms",
-        "license_url": "https://atcddd.fhi.no/copyright_disclaimer/",
-        "license_status": "human_review_required",
-    },
-    "rare_drugs": {
-        "license_name": "U.S. FDA public source",
-        "license_url": "https://www.accessdata.fda.gov/scripts/opdlisting/oopd/",
-        "license_status": "reviewed_public_government_source",
-    },
+    "atc": WHO_ATC_LICENSE,
+    "rare_drugs": FDA_RARE_LICENSE,
 }
 IDENTITY_UNCERTAINTY_STOP_TOKENS = frozenset(
     {
@@ -2098,13 +2096,21 @@ def _issue(
     }
 
 
-def _split_south_asia_ingredients(value: object) -> list[tuple[str, str]]:
+def _split_declared_ingredients(
+    value: object, raw_components: Callable[[object], list[str]]
+) -> list[tuple[str, str]]:
+    """Normalize each declared component and keep only ones with real signal."""
+
     result: list[tuple[str, str]] = []
-    for raw in _south_asia_raw_components(value):
+    for raw in raw_components(value):
         normalized = _normalize_south_asia_component(raw)
         if len(normalized) >= 3 and _has_ingredient_signal(normalized):
             result.append((raw, normalized))
     return result
+
+
+def _split_south_asia_ingredients(value: object) -> list[tuple[str, str]]:
+    return _split_declared_ingredients(value, _south_asia_raw_components)
 
 
 def _bhutan_raw_components(value: object) -> list[str]:
@@ -2141,12 +2147,7 @@ def _bhutan_raw_components(value: object) -> list[str]:
 
 
 def _split_bhutan_ingredients(value: object) -> list[tuple[str, str]]:
-    result: list[tuple[str, str]] = []
-    for raw in _bhutan_raw_components(value):
-        normalized = _normalize_south_asia_component(raw)
-        if len(normalized) >= 3 and _has_ingredient_signal(normalized):
-            result.append((raw, normalized))
-    return result
+    return _split_declared_ingredients(value, _bhutan_raw_components)
 
 
 def _south_asia_raw_components(value: object) -> list[str]:
@@ -4241,7 +4242,6 @@ def _identity_uncertainty_relation(target_key: str, candidate_key: str) -> str:
             return "source_identity_more_specific"
         if candidate_tokens < target_tokens:
             return "source_identity_broader"
-    target_discriminators = target_tokens - IDENTITY_UNCERTAINTY_STOP_TOKENS
     vaccine_source_markers = {
         "antigen",
         "attenuated",

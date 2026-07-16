@@ -179,12 +179,6 @@ def run_pipeline(root: Path = ROOT) -> PipelineResult:
     )
 
 
-def build_dataset(root: Path = ROOT) -> pd.DataFrame:
-    """just the final dataframe, for callers that don't need the audit tables."""
-
-    return run_pipeline(root).output
-
-
 # stage 1: who atc + l1-l5 lookups
 
 
@@ -321,6 +315,15 @@ def load_rare_substance_keys(
 # stage 3a: fda load + original approvals + atc match
 
 
+def dedup_by_product_name(long_rows: pd.DataFrame) -> pd.DataFrame:
+    """Collapse the same brand/substance repeated across strengths and variants."""
+
+    name_key = long_rows["product_name"].str.lower().str.strip()
+    return long_rows.assign(_name_key=name_key).drop_duplicates(
+        ["_name_key", "substance_key", "atc_level5", "source"]
+    ).drop(columns="_name_key")
+
+
 def load_fda_product_substances(
     fda_dir: Path,
     atc_l5_lookup: pd.DataFrame,
@@ -387,11 +390,7 @@ def load_fda_product_substances(
         ],
         ignore_index=True,
     )
-    # dedup same brand/substance repeated across strengths
-    long_rows["_name_key"] = long_rows["product_name"].str.lower().str.strip()
-    long_rows = long_rows.drop_duplicates(["_name_key", "substance_key", "atc_level5", "source"]).drop(
-        columns="_name_key"
-    )
+    long_rows = dedup_by_product_name(long_rows)
     return long_rows[LONG_COLUMNS].copy(), metrics, unmatched_audit
 
 
@@ -498,11 +497,7 @@ def load_hsa_product_substances(
     if long_rows.empty:
         return pd.DataFrame(columns=LONG_COLUMNS), fallback_audit, unmatched_audit
 
-    # dedup same brand/substance across strengths/variants
-    long_rows["_name_key"] = long_rows["product_name"].str.lower().str.strip()
-    long_rows = long_rows.drop_duplicates(["_name_key", "substance_key", "atc_level5", "source"]).drop(
-        columns="_name_key"
-    )
+    long_rows = dedup_by_product_name(long_rows)
     return long_rows[LONG_COLUMNS].copy(), fallback_audit, unmatched_audit
 
 
