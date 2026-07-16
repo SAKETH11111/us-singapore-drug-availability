@@ -27,6 +27,17 @@ from xml.etree import ElementTree
 
 import pandas as pd
 
+from .atlas_adjudications import (
+    CURATED_CONCEPT_KEYS,
+    adjudicate_eml_concept_product,
+    aggregate_current_marketing,
+    canonical_reviewed_identity,
+    canonicalize_atc,
+    classify_eml_scope,
+    external_source_for_observation,
+    has_veterinary_marker,
+    refine_identity,
+)
 from .normalize import (
     normalize_fda_component,
     normalize_ingredient,
@@ -50,7 +61,7 @@ from .pipeline import (
 
 
 ATLAS_NAMESPACE = uuid.UUID("186c4a4a-a3aa-5be5-968d-ce32b54e4054")
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 SUBSTANCE_IDENTITY_VERSION = "normalized-ingredient-key-v1"
 UNIVERSE_ID = "WHO_EML_2025"
 SUPPORTED_COUNTRIES = ("US", "SG", "BD", "BT")
@@ -175,6 +186,8 @@ PRODUCT_COLUMNS = [
     "observation_ordinal",
     "form",
     "strength",
+    "raw_product_atc_codes",
+    "product_atc_codes",
     "sponsor",
     "approval_date",
     "validity_date",
@@ -193,7 +206,7 @@ INGREDIENT_COLUMNS = [
     "raw_strength",
     "normalized_ingredient_key",
     "is_combo",
-    "atc_code",
+    "ingredient_atc_codes",
     "match_method",
 ]
 
@@ -261,6 +274,8 @@ class BuildArtifact:
     view_paths: dict[str, Path]
     view_hashes: dict[str, str]
     report_path: Path
+    verification_report_path: Path
+    verification_evidence_path: Path
 
 
 @dataclass(frozen=True)
@@ -404,6 +419,8 @@ class FdaAdapter:
                     "observation_ordinal": ordinal,
                     "form": str(getattr(row, "Form", "")),
                     "strength": str(getattr(row, "Strength", "")),
+                    "raw_product_atc_codes": "",
+                    "product_atc_codes": "",
                     "sponsor": str(getattr(row, "SponsorName", "")),
                     "approval_date": _iso_date(row.approval_date),
                     "validity_date": "",
@@ -493,6 +510,23 @@ class HsaAdapter:
         issue_rows: list[dict[str, object]] = []
         for ordinal, row in enumerate(source.itertuples(index=False)):
             product_key = str(row.licence_no)
+            raw_product_atc = str(getattr(row, "atc_code", "")).strip()
+            product_atc_values: list[str] = []
+            for raw_atc_component in re.split(r"&&|[|;,]", raw_product_atc):
+                product_atc, atc_state = canonicalize_atc(raw_atc_component)
+                if product_atc and product_atc not in product_atc_values:
+                    product_atc_values.append(product_atc)
+                if atc_state in {"invalid", "corrected"}:
+                    issue_rows.append(
+                        _issue(
+                            "SG",
+                            product_key,
+                            f"{atc_state}_product_atc",
+                            "warning",
+                            f"raw={raw_atc_component.strip()}; canonical={product_atc}",
+                        )
+                    )
+            product_atc = "|".join(product_atc_values)
             raw_components = split_hsa_ingredients(row.active_ingredients)
             normalized_components = [
                 (index, raw, normalize_ingredient(raw))
@@ -535,6 +569,8 @@ class HsaAdapter:
                     "observation_ordinal": ordinal,
                     "form": str(getattr(row, "dosage_form", "")),
                     "strength": str(getattr(row, "strength", "")),
+                    "raw_product_atc_codes": raw_product_atc,
+                    "product_atc_codes": product_atc,
                     "sponsor": str(getattr(row, "license_holder", "")),
                     "approval_date": _iso_date(getattr(row, "approval_d", "")),
                     "validity_date": "",
@@ -545,7 +581,6 @@ class HsaAdapter:
                     "source_retired": None,
                 }
             )
-            atc_code = str(getattr(row, "atc_code", "")).strip().upper()
             raw_strength = str(getattr(row, "strength", ""))
             strength_parts = [part.strip() for part in raw_strength.split("&&")]
             for position, (source_position, raw_component, normalized) in enumerate(pairs):
@@ -562,7 +597,7 @@ class HsaAdapter:
                         raw_component,
                         normalized,
                         is_combo,
-                        atc_code,
+                        "",
                         raw_strength=component_strength,
                     )
                 )
@@ -635,6 +670,17 @@ class BangladeshAdapter:
             extras = concept.get("extras") or {}
             product_key = str(concept.get("id") or ordinal)
             raw_text = str(extras.get("generic_content_raw") or "")
+            product_name = str(
+                extras.get("trade_name") or concept.get("display_name") or ""
+            )
+            dosage_form = str(extras.get("dosage_form") or "")
+            veterinary = has_veterinary_marker(
+                product_name,
+                raw_text,
+                dosage_form,
+                extras.get("company"),
+                extras.get("dar_quality_flag"),
+            )
             raw_components = _south_asia_raw_components(raw_text)
             pairs = _split_south_asia_ingredients(raw_text)
             unresolved_component_count = max(len(raw_components) - len(pairs), 0)
@@ -653,12 +699,22 @@ class BangladeshAdapter:
                         f"unresolved_components={unresolved_component_count}; raw={raw_text}",
                     )
                 )
+            if veterinary:
+                issue_rows.append(
+                    _issue(
+                        "BD",
+                        product_key,
+                        "outside_human_scope_veterinary",
+                        "warning",
+                        f"product={product_name}; form={dosage_form}",
+                    )
+                )
             product_rows.append(
                 {
                     "country_code": "BD",
                     "source_product_key": product_key,
                     "registration_number": str(extras.get("dar_number") or ""),
-                    "product_name": str(extras.get("trade_name") or concept.get("display_name") or ""),
+                    "product_name": product_name,
                     "raw_ingredient_text": raw_text,
                     "ingredient_component_count": len(
                         {normalized for _, normalized in pairs}
@@ -668,14 +724,20 @@ class BangladeshAdapter:
                     "application_type": "",
                     "legacy_eligible": False,
                     "observation_ordinal": ordinal,
-                    "form": str(extras.get("dosage_form") or ""),
+                    "form": dosage_form,
                     "strength": "",
+                    "raw_product_atc_codes": "",
+                    "product_atc_codes": "",
                     "sponsor": str(extras.get("company") or ""),
                     "approval_date": "",
                     "validity_date": "",
-                    "included_in_presence": bool(pairs),
+                    "included_in_presence": bool(pairs) and not veterinary,
                     "current_qualified": None,
-                    "exclusion_reason": "" if pairs else "unresolved_ingredient",
+                    "exclusion_reason": (
+                        "outside_human_scope_veterinary"
+                        if veterinary
+                        else "" if pairs else "unresolved_ingredient"
+                    ),
                     "marketing_status": "",
                     "source_retired": bool(concept.get("retired", False)),
                 }
@@ -860,6 +922,8 @@ class BhutanAdapter:
                     "observation_ordinal": ordinal,
                     "form": "",
                     "strength": "",
+                    "raw_product_atc_codes": "",
+                    "product_atc_codes": "",
                     "sponsor": str(row["MAH"]),
                     "approval_date": "",
                     "validity_date": _iso_date(validity),
@@ -1072,7 +1136,7 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
     if active_eeml.empty:
         raise ValueError("eEML snapshot has no Status=Added recommendation rows")
     active_eeml["normalized_ingredient_key"] = active_eeml["Medicine name"].map(
-        normalize_ingredient
+        lambda raw: refine_identity(raw, normalize_ingredient(raw))
     )
     active_eeml["member_keys"] = active_eeml["Medicine name"].map(
         _eeml_medicine_components
@@ -1122,6 +1186,7 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
     legacy_rows = _build_legacy_observations(raw_root)
 
     normalizer_path = Path(__file__).with_name("normalize.py")
+    adjudication_path = Path(__file__).with_name("atlas_adjudications.py")
     source_hashes = {
         code: _directory_content_hash(raw_dirs[code]) for code in country_codes
     }
@@ -1145,6 +1210,7 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
         "countries": list(country_codes),
         "universe_id": spec.universe_id,
         "normalizer_sha256": _file_hash(normalizer_path),
+        "adjudication_sha256": _file_hash(adjudication_path),
         "builder_sha256": _file_hash(Path(__file__)),
         "legacy_dependency_hashes": legacy_dependency_hashes,
         "fetch_manifest_sha256": fetch_manifest_hash,
@@ -1196,7 +1262,14 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
         if violations:
             raise RuntimeError(f"Atlas foreign-key violations: {violations[:5]}")
 
-        view_paths, view_hashes, report_path, report_hash = _write_views_and_report(
+        (
+            view_paths,
+            view_hashes,
+            report_path,
+            report_hash,
+            verification_report_path,
+            verification_evidence_path,
+        ) = _write_views_and_report(
             staging=staging,
             database_path=database_path,
             build_id=build_id,
@@ -1258,6 +1331,8 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
             "table_hashes": table_hashes,
             "view_hashes": view_hashes,
             "data_quality_report_sha256": report_hash,
+            "verification_report_sha256": _file_hash(verification_report_path),
+            "verification_evidence_sha256": _file_hash(verification_evidence_path),
         }
         manifest_path = staging / "manifest.json"
         manifest_path.write_text(
@@ -1283,6 +1358,8 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
         },
         view_hashes=view_hashes,
         report_path=published_dir / report_path.name,
+        verification_report_path=published_dir / verification_report_path.name,
+        verification_evidence_path=published_dir / verification_evidence_path.name,
     )
 
 
@@ -1357,7 +1434,10 @@ def compare_atlas(
             SELECT rp.country_code, pi.substance_id, rp.product_id,
                    CASE WHEN rp.ingredient_component_count > 1 THEN 1 ELSE 0 END
                        AS is_combo,
-                   rp.product_name, rp.current_qualified
+                   rp.product_name, rp.current_qualified, rp.marketing_status,
+                   rp.source_product_key, rp.raw_ingredient_text,
+                   'exact_identity' AS evidence_rule,
+                   '' AS adjudication_evidence_note
             FROM registered_products AS rp
             JOIN product_ingredients AS pi USING (product_id)
             JOIN source_snapshots AS ss USING (snapshot_id)
@@ -1367,6 +1447,76 @@ def compare_atlas(
             """,
             connection,
             params=selected,
+        )
+        curated_observations = pd.read_sql_query(
+            f"""
+            SELECT a.country_code, a.target_substance_id AS substance_id,
+                   rp.product_id,
+                   CASE
+                       WHEN a.mode_override = 'STANDALONE' THEN 0
+                       WHEN a.mode_override = 'COMBO_ONLY' THEN 1
+                       WHEN rp.ingredient_component_count > 1 THEN 1
+                       ELSE 0
+                   END AS is_combo,
+                   rp.product_name, rp.current_qualified, rp.marketing_status,
+                   rp.source_product_key, rp.raw_ingredient_text,
+                   a.rule AS evidence_rule,
+                   a.evidence_note AS adjudication_evidence_note
+            FROM eml_product_adjudications AS a
+            JOIN registered_products AS rp USING (product_id)
+            JOIN source_snapshots AS ss USING (snapshot_id)
+            WHERE a.universe_id = ?
+              AND a.country_code IN ({placeholders})
+              AND a.decision_state = 'VERIFIED_PRESENT'
+              AND rp.included_in_presence = 1
+              AND ss.snapshot_status = 'accepted'
+            """,
+            connection,
+            params=(universe_id, *selected),
+        )
+        observations = pd.concat(
+            [observations, curated_observations], ignore_index=True
+        ).drop_duplicates(["country_code", "substance_id", "product_id"])
+        indeterminate_adjudications = pd.read_sql_query(
+            f"""
+            SELECT a.country_code, a.target_substance_id, a.product_id,
+                   a.evidence_note, a.needs_external_source,
+                   rp.current_qualified
+            FROM eml_product_adjudications AS a
+            JOIN registered_products AS rp USING (product_id)
+            JOIN source_snapshots AS ss USING (snapshot_id)
+            WHERE a.universe_id = ?
+              AND a.country_code IN ({placeholders})
+              AND a.decision_state = 'INDETERMINATE'
+              AND rp.included_in_presence = 1
+              AND ss.snapshot_status = 'accepted'
+            """,
+            connection,
+            params=(universe_id, *selected),
+        )
+        excluded_veterinary = pd.read_sql_query(
+            f"""
+            SELECT rp.country_code, pi.substance_id, rp.product_id,
+                   rp.product_name, rp.source_product_key,
+                   rp.raw_ingredient_text
+            FROM registered_products AS rp
+            JOIN product_ingredients AS pi USING (product_id)
+            JOIN source_snapshots AS ss USING (snapshot_id)
+            WHERE rp.country_code IN ({placeholders})
+              AND rp.exclusion_reason = 'outside_human_scope_veterinary'
+              AND ss.snapshot_status = 'accepted'
+            """,
+            connection,
+            params=selected,
+        ).drop_duplicates(["country_code", "substance_id", "product_id"])
+        scope_classifications = pd.read_sql_query(
+            """
+            SELECT substance_id, scope_category, evidence_note
+            FROM eml_scope_classifications
+            WHERE universe_id = ?
+            """,
+            connection,
+            params=(universe_id,),
         )
         identity_uncertainties = pd.read_sql_query(
             f"""
@@ -1417,42 +1567,95 @@ def compare_atlas(
             ["country_code", "target_substance_id"], sort=False
         )
     }
+    indeterminate_adjudication_groups = {
+        (country_code, target_substance_id): group
+        for (country_code, target_substance_id), group in indeterminate_adjudications.groupby(
+            ["country_code", "target_substance_id"], sort=False
+        )
+    }
+    excluded_veterinary_groups = {
+        (country_code, substance_id): group
+        for (country_code, substance_id), group in excluded_veterinary.groupby(
+            ["country_code", "substance_id"], sort=False
+        )
+    }
+    scope_for = (
+        scope_classifications.drop_duplicates("substance_id")
+        .set_index("substance_id")
+        .to_dict("index")
+    )
     long_rows: list[dict[str, object]] = []
     for substance in universe.itertuples(index=False):
         for country_code in selected:
             snapshot = snapshot_for.get(country_code)
-            if snapshot is None or snapshot["snapshot_status"] != "accepted":
+            scope = scope_for.get(substance.substance_id)
+            scope_status = str(scope["scope_category"]) if scope else ""
+            current_authorization = "UNKNOWN"
+            current_marketing = "UNKNOWN"
+            needs_external_sources: list[str] = []
+            standalone_count = 0
+            combo_count = 0
+
+            if snapshot is None:
+                source_name = ""
+                source_url = ""
+                coverage_scope = ""
+                snapshot_status = "missing"
+                acceptance_reason = "no_snapshot"
+            else:
+                source_name = str(snapshot["source_name"])
+                source_url = str(snapshot["source_url"])
+                coverage_scope = str(snapshot["coverage_scope"])
+                snapshot_status = str(snapshot["snapshot_status"])
+                acceptance_reason = str(snapshot["acceptance_reason"])
+
+            if scope:
+                observation = "OUT_OF_SCOPE"
+                uncertainty_reason = ""
+                evidence_note = str(scope["evidence_note"])
+            elif snapshot is None or snapshot["snapshot_status"] != "accepted":
                 observation = "UNKNOWN"
                 uncertainty_reason = "snapshot_missing_or_rejected"
-                standalone_count = 0
-                combo_count = 0
                 if snapshot is None:
                     evidence_note = "No source snapshot is available for this country."
-                    source_name = ""
-                    source_url = ""
-                    coverage_scope = ""
-                    snapshot_status = "missing"
-                    acceptance_reason = "no_snapshot"
                 else:
-                    source_name = str(snapshot["source_name"])
-                    source_url = str(snapshot["source_url"])
-                    coverage_scope = str(snapshot["coverage_scope"])
-                    snapshot_status = str(snapshot["snapshot_status"])
-                    acceptance_reason = str(snapshot["acceptance_reason"])
                     evidence_note = (
                         "Source snapshot is not accepted for absence inference: "
                         f"{acceptance_reason}."
                     )
             else:
                 group = observation_groups.get((country_code, substance.substance_id))
+                original_group = group
                 identity_group = uncertainty_groups.get(
                     (country_code, substance.substance_id)
                 )
-                source_name = str(snapshot["source_name"])
-                source_url = str(snapshot["source_url"])
-                coverage_scope = str(snapshot["coverage_scope"])
-                snapshot_status = str(snapshot["snapshot_status"])
-                acceptance_reason = str(snapshot["acceptance_reason"])
+                indeterminate_adjudication_group = indeterminate_adjudication_groups.get(
+                    (country_code, substance.substance_id)
+                )
+                veterinary_group = excluded_veterinary_groups.get(
+                    (country_code, substance.substance_id)
+                )
+                missing_category_source = external_source_for_observation(
+                    country_code, substance.preferred_name
+                )
+                if country_code == "BD":
+                    needs_external_sources.append(
+                        "BANGLADESH_CURRENT_MARKETING_STATUS"
+                    )
+
+                if original_group is not None and not original_group.empty:
+                    if country_code == "BT":
+                        if original_group["current_qualified"].eq(1).any():
+                            current_authorization = "CONFIRMED"
+                        elif original_group["current_qualified"].isna().any():
+                            current_authorization = "UNKNOWN"
+                        else:
+                            current_authorization = "NOT_CURRENT"
+                    if country_code == "US":
+                        current_marketing = aggregate_current_marketing(
+                            original_group["marketing_status"]
+                        )
+
                 indeterminate_current = False
                 identity_review_group = identity_group
                 if country_code in current_qualified and group is not None and not group.empty:
@@ -1478,8 +1681,6 @@ def compare_atlas(
                 if indeterminate_current:
                     observation = "UNKNOWN"
                     uncertainty_reason = "current_qualification_indeterminate"
-                    standalone_count = 0
-                    combo_count = 0
                     evidence_note = (
                         "Listed product evidence exists, but current qualification is "
                         "indeterminate for this substance because source evidence conflicts "
@@ -1496,9 +1697,41 @@ def compare_atlas(
                     standalone_count = len(standalone_ids)
                     combo_count = len(combo_ids)
                     observation = "STANDALONE" if standalone_count else "COMBO_ONLY"
+                    curated_rules = sorted(
+                        rule
+                        for rule in set(group["evidence_rule"].astype(str))
+                        if rule != "exact_identity"
+                    )
                     evidence_note = (
-                        f"Observed in {standalone_count + combo_count} product records from "
+                        f"Observed in the selected source snapshot through "
+                        f"{standalone_count + combo_count} product records from "
                         f"{source_name}: {standalone_count} standalone and {combo_count} combination."
+                    )
+                    if curated_rules:
+                        evidence_note += " Curated rules: " + ", ".join(curated_rules) + "."
+                elif (
+                    indeterminate_adjudication_group is not None
+                    and not indeterminate_adjudication_group.empty
+                ):
+                    observation = "UNKNOWN"
+                    uncertainty_reason = "concept_evidence_indeterminate"
+                    evidence_note = " ".join(
+                        sorted(
+                            set(
+                                indeterminate_adjudication_group["evidence_note"].astype(str)
+                            )
+                        )
+                    )
+                    needs_external_sources.extend(
+                        sorted(
+                            source
+                            for source in set(
+                                indeterminate_adjudication_group[
+                                    "needs_external_source"
+                                ].astype(str)
+                            )
+                            if source
+                        )
                     )
                 elif identity_review_group is not None and not identity_review_group.empty:
                     observation = "UNKNOWN"
@@ -1514,23 +1747,56 @@ def compare_atlas(
                         f"review: {', '.join(candidate_names)}. Absence is indeterminate; "
                         "no equivalence or presence assertion is made."
                     )
+                elif missing_category_source:
+                    observation = "UNKNOWN"
+                    uncertainty_reason = "category_source_not_ingested"
+                    needs_external_sources.append(missing_category_source)
+                    evidence_note = (
+                        f"The selected source ({source_name}) cannot establish absence for "
+                        f"this product category; needs external source {missing_category_source}."
+                    )
                 else:
                     observation = "OBSERVED_ABSENCE"
                     uncertainty_reason = ""
-                    standalone_count = 0
-                    combo_count = 0
                     evidence_note = str(snapshot["observed_absence_wording"])
+                    if veterinary_group is not None and not veterinary_group.empty:
+                        veterinary_products = sorted(
+                            {
+                                f"{row.product_name} ({row.source_product_key})"
+                                for row in veterinary_group.itertuples(index=False)
+                            }
+                        )
+                        evidence_note = (
+                            "only a veterinary product was observed and no human-scope product "
+                            "was found in the ingested register. Excluded veterinary evidence: "
+                            + "; ".join(veterinary_products)
+                            + "."
+                        )
                     if country_code in current_qualified:
                         evidence_note = (
                             "Not observed among current-qualified product records. "
                             + evidence_note
                         )
+            observed_in_source_snapshot: bool | None
+            if observation in {"STANDALONE", "COMBO_ONLY"}:
+                observed_in_source_snapshot = True
+            elif observation == "OBSERVED_ABSENCE":
+                observed_in_source_snapshot = False
+            else:
+                observed_in_source_snapshot = None
             long_rows.append(
                 {
                     "substance_id": substance.substance_id,
                     "preferred_name": substance.preferred_name,
                     "country_code": country_code,
                     "observation": observation,
+                    "observed_in_source_snapshot": observed_in_source_snapshot,
+                    "current_authorization": current_authorization,
+                    "current_marketing": current_marketing,
+                    "needs_external_source": "|".join(
+                        dict.fromkeys(needs_external_sources)
+                    ),
+                    "scope_status": scope_status,
                     "uncertainty_reason": uncertainty_reason,
                     "standalone_product_count": standalone_count,
                     "combo_product_count": combo_count,
@@ -1543,7 +1809,7 @@ def compare_atlas(
                     "presence_basis": (
                         "current_qualified"
                         if country_code in current_qualified
-                        else "listed_register_presence"
+                        else "selected_source_snapshot"
                     ),
                 }
             )
@@ -1557,8 +1823,11 @@ def compare_atlas(
         ["substance_id", "preferred_name"], sort=True
     ):
         accepted_count = int(group["snapshot_status"].eq("accepted").sum())
-        determinate_count = int(group["observation"].ne("UNKNOWN").sum())
+        determinate_count = int(
+            group["observation"].isin({"STANDALONE", "COMBO_ONLY", "OBSERVED_ABSENCE"}).sum()
+        )
         present_count = int(group["observation"].isin(present_states).sum())
+        standalone_count = int(group["observation"].eq("STANDALONE").sum())
         summary_rows.append(
             {
                 "substance_id": substance_id,
@@ -1580,6 +1849,9 @@ def compare_atlas(
                 "all_selected_present": (
                     determinate_count == len(selected) and present_count == len(selected)
                 ),
+                "standalone_in_all_selected": (
+                    determinate_count == len(selected) and standalone_count == len(selected)
+                ),
                 "observed_gap_country_count": int(
                     group["observation"].eq("OBSERVED_ABSENCE").sum()
                 ),
@@ -1597,6 +1869,9 @@ def compare_atlas(
                     if group.loc[group["country_code"].eq(code), "observation"]
                     .eq("UNKNOWN")
                     .any()
+                ),
+                "out_of_scope_country_count": int(
+                    group["observation"].eq("OUT_OF_SCOPE").sum()
                 ),
             }
         )
@@ -1770,7 +2045,7 @@ def _ingredient(
     raw_component: str,
     normalized: str,
     is_combo: bool,
-    atc_code: str = "",
+    ingredient_atc_codes: str = "",
     match_method: str = "source_ingredient_normalization",
     raw_strength: str = "",
 ) -> dict[str, object]:
@@ -1782,7 +2057,7 @@ def _ingredient(
         "raw_strength": str(raw_strength),
         "normalized_ingredient_key": str(normalized),
         "is_combo": bool(is_combo),
-        "atc_code": str(atc_code),
+        "ingredient_atc_codes": str(ingredient_atc_codes),
         "match_method": match_method,
     }
 
@@ -2007,6 +2282,7 @@ def _eeml_medicine_components(value: object) -> list[str]:
     components: list[str] = []
     for raw_part in raw_parts:
         normalized = normalize_ingredient(raw_part)
+        normalized = refine_identity(raw_part, normalized)
         if len(normalized) >= 3 and normalized not in components:
             components.append(normalized)
     return components
@@ -2081,7 +2357,7 @@ def _legacy_rows_from_atlas(connection: sqlite3.Connection) -> pd.DataFrame:
         SELECT
             s.normalized_ingredient_key AS substance_key,
             CASE rp.country_code WHEN 'US' THEN 'FDA' ELSE 'HSA' END AS source,
-            pi.atc_code AS atc_level5,
+            pi.ingredient_atc_codes AS atc_level5,
             '' AS "Therapeutic Class (L1)",
             '' AS "Drug Class (L2)",
             '' AS "Pharmacological Subgroup (L3)",
@@ -2348,6 +2624,52 @@ def _build_table_frames(
     source_snapshots = pd.DataFrame(snapshot_rows)
     registered_products = pd.concat(product_frames, ignore_index=True)
     staged_ingredients = pd.concat(ingredient_frames, ignore_index=True)
+    if not staged_ingredients.empty:
+        original_identity_keys = staged_ingredients["normalized_ingredient_key"].copy()
+        refined_identity_keys = staged_ingredients.apply(
+            lambda row: refine_identity(
+                row["raw_component"], row["normalized_ingredient_key"]
+            ),
+            axis=1,
+        )
+        refined_mask = refined_identity_keys.ne(
+            original_identity_keys
+        )
+        reviewed_equivalence_mask = original_identity_keys.map(
+            canonical_reviewed_identity
+        ).ne(original_identity_keys)
+        staged_ingredients.loc[
+            refined_mask & reviewed_equivalence_mask, "match_method"
+        ] = "atlas_reviewed_equivalence"
+        staged_ingredients.loc[
+            refined_mask & ~reviewed_equivalence_mask, "match_method"
+        ] = (
+            "atlas_identity_refinement"
+        )
+        staged_ingredients["normalized_ingredient_key"] = refined_identity_keys
+        resolved_counts = (
+            staged_ingredients.groupby(
+                ["country_code", "source_product_key"], sort=False
+            )["normalized_ingredient_key"]
+            .nunique()
+            .to_dict()
+        )
+        registered_products["ingredient_component_count"] = [
+            int(
+                resolved_counts.get(
+                    (row.country_code, row.source_product_key), 0
+                )
+            )
+            + int(row.unresolved_component_count)
+            for row in registered_products.itertuples(index=False)
+        ]
+        component_count_for = registered_products.set_index(
+            ["country_code", "source_product_key"]
+        )["ingredient_component_count"].to_dict()
+        staged_ingredients["is_combo"] = [
+            component_count_for[(row.country_code, row.source_product_key)] > 1
+            for row in staged_ingredients.itertuples(index=False)
+        ]
     staged_issues = (
         pd.concat(issue_frames, ignore_index=True)
         if any(not frame.empty for frame in issue_frames)
@@ -2390,7 +2712,7 @@ def _build_table_frames(
                 "position",
                 "raw_component",
                 "raw_strength",
-                "atc_code",
+                "ingredient_atc_codes",
                 "match_method",
             ]
         )
@@ -2441,9 +2763,34 @@ def _build_table_frames(
     )
     entry_rows: list[dict[str, object]] = []
     member_rows: list[dict[str, object]] = []
+    eml_atc_issue_rows: list[dict[str, object]] = []
+    eml_scope_rows: list[dict[str, object]] = []
     for source_ordinal, (_, row) in enumerate(active_eeml.reset_index(drop=True).iterrows()):
         entry_key = str(row["normalized_ingredient_key"])
         entry_id = _stable_id("eml-entry", spec.universe_id, source_ordinal, entry_key)
+        raw_atc_codes = str(row.get("ATC codes", ""))
+        canonical_atc_codes: list[str] = []
+        for raw_atc_code in re.split(r"\s*[,;|]\s*", raw_atc_codes):
+            if not raw_atc_code:
+                continue
+            canonical_atc_code, issue_state = canonicalize_atc(
+                raw_atc_code, row.get("Medicine name", "")
+            )
+            if canonical_atc_code and canonical_atc_code not in canonical_atc_codes:
+                canonical_atc_codes.append(canonical_atc_code)
+            if issue_state in {"corrected", "invalid"}:
+                eml_atc_issue_rows.append(
+                    {
+                        "issue_id": _stable_id(
+                            "eml-atc-issue", entry_id, raw_atc_code, issue_state
+                        ),
+                        "entry_id": entry_id,
+                        "medicine_name": str(row.get("Medicine name", "")),
+                        "raw_atc_code": raw_atc_code,
+                        "canonical_atc_code": canonical_atc_code,
+                        "issue_state": issue_state,
+                    }
+                )
         entry_rows.append(
             {
                 "entry_id": entry_id,
@@ -2453,7 +2800,8 @@ def _build_table_frames(
                 "eml_section": str(row.get("EML section", "")),
                 "formulations": str(row.get("Formulations", "")),
                 "indication": str(row.get("Indication", "")),
-                "atc_codes": str(row.get("ATC codes", "")),
+                "raw_atc_codes": raw_atc_codes,
+                "atc_codes": ", ".join(canonical_atc_codes),
                 "combined_with": str(row.get("Combined with", "")),
                 "source_status": str(row.get("Status", "")),
             }
@@ -2466,10 +2814,129 @@ def _build_table_frames(
                     "member_role": "medicine_name",
                 }
             )
+            scope_category = classify_eml_scope(
+                row.get("Medicine name", ""), row.get("Formulations", "")
+            )
+            if scope_category:
+                eml_scope_rows.append(
+                    {
+                        "scope_id": _stable_id(
+                            "eml-scope", spec.universe_id, key, scope_category
+                        ),
+                        "universe_id": spec.universe_id,
+                        "substance_id": substance_id_for[key],
+                        "preferred_name": key,
+                        "scope_category": scope_category,
+                        "evidence_note": (
+                            f"EML recommendation '{row.get('Medicine name', '')}' is classified "
+                            f"as {scope_category}; ordinary drug-register absence is not applicable."
+                        ),
+                    }
+                )
     essential_medicine_entries = pd.DataFrame(entry_rows)
+    eml_atc_issues = pd.DataFrame(
+        eml_atc_issue_rows,
+        columns=[
+            "issue_id",
+            "entry_id",
+            "medicine_name",
+            "raw_atc_code",
+            "canonical_atc_code",
+            "issue_state",
+        ],
+    )
+    eml_scope_classifications = pd.DataFrame(
+        eml_scope_rows,
+        columns=[
+            "scope_id",
+            "universe_id",
+            "substance_id",
+            "preferred_name",
+            "scope_category",
+            "evidence_note",
+        ],
+    ).drop_duplicates("scope_id")
     essential_medicine_members = pd.DataFrame(member_rows).drop_duplicates(
         ["entry_id", "substance_id", "member_role"]
     )
+
+    product_ingredient_keys = (
+        staged_ingredients.groupby("product_id", sort=False)[
+            "normalized_ingredient_key"
+        ]
+        .agg(lambda values: frozenset(str(value) for value in values))
+        .to_dict()
+    )
+    concept_adjudication_rows: list[dict[str, object]] = []
+    concept_targets = sorted(eeml_substance_keys & CURATED_CONCEPT_KEYS)
+    included_products = registered_products[
+        registered_products["included_in_presence"].eq(True)  # noqa: E712
+    ]
+    for target_key in concept_targets:
+        target_substance_id = substance_id_for[target_key]
+        for product in included_products.itertuples(index=False):
+            adjudication = adjudicate_eml_concept_product(
+                target_key,
+                country_code=str(product.country_code),
+                product_name=product.product_name,
+                raw_ingredient_text=product.raw_ingredient_text,
+                form=product.form,
+                strength=product.strength,
+                product_atc_codes=product.product_atc_codes,
+                ingredient_keys=product_ingredient_keys.get(
+                    str(product.product_id), frozenset()
+                ),
+            )
+            if adjudication is None:
+                continue
+            evidence_note = (
+                f"Curated EML concept rule `{adjudication.rule}` evaluated source product "
+                f"'{product.product_name}' ({product.source_product_key}); raw ingredients: "
+                f"{product.raw_ingredient_text}."
+            )
+            if adjudication.state == "INDETERMINATE":
+                evidence_note += (
+                    " The current source row lacks the evidence required to resolve the "
+                    f"concept; needs {adjudication.needs_external_source}."
+                )
+            concept_adjudication_rows.append(
+                {
+                    "adjudication_id": _stable_id(
+                        "eml-product-adjudication",
+                        spec.universe_id,
+                        product.country_code,
+                        target_substance_id,
+                        product.product_id,
+                        adjudication.rule,
+                    ),
+                    "universe_id": spec.universe_id,
+                    "country_code": str(product.country_code),
+                    "target_substance_id": target_substance_id,
+                    "target_key": target_key,
+                    "product_id": str(product.product_id),
+                    "decision_state": adjudication.state,
+                    "rule": adjudication.rule,
+                    "mode_override": adjudication.mode_override,
+                    "evidence_note": evidence_note,
+                    "needs_external_source": adjudication.needs_external_source,
+                }
+            )
+    eml_product_adjudications = pd.DataFrame(
+        concept_adjudication_rows,
+        columns=[
+            "adjudication_id",
+            "universe_id",
+            "country_code",
+            "target_substance_id",
+            "target_key",
+            "product_id",
+            "decision_state",
+            "rule",
+            "mode_override",
+            "evidence_note",
+            "needs_external_source",
+        ],
+    ).drop_duplicates("adjudication_id")
 
     listed_source_identities = staged_ingredients.merge(
         registered_products[
@@ -2610,7 +3077,10 @@ def _build_table_frames(
         "product_ingredients": product_ingredients,
         "essential_medicine_sets": essential_medicine_sets,
         "essential_medicine_entries": essential_medicine_entries,
+        "eml_atc_issues": eml_atc_issues,
+        "eml_scope_classifications": eml_scope_classifications,
         "essential_medicine_members": essential_medicine_members,
+        "eml_product_adjudications": eml_product_adjudications,
         "substance_identity_uncertainties": substance_identity_uncertainties,
         "ingest_issues": staged_issues,
         "legacy_compatibility_observations": legacy_compatibility_observations,
@@ -2684,6 +3154,8 @@ def _write_database(path: Path, frames: dict[str, pd.DataFrame]) -> None:
                 observation_ordinal INTEGER NOT NULL,
                 form TEXT NOT NULL,
                 strength TEXT NOT NULL,
+                raw_product_atc_codes TEXT NOT NULL,
+                product_atc_codes TEXT NOT NULL,
                 sponsor TEXT NOT NULL,
                 approval_date TEXT NOT NULL,
                 validity_date TEXT NOT NULL,
@@ -2705,7 +3177,7 @@ def _write_database(path: Path, frames: dict[str, pd.DataFrame]) -> None:
                 position INTEGER NOT NULL,
                 raw_component TEXT NOT NULL,
                 raw_strength TEXT NOT NULL,
-                atc_code TEXT NOT NULL,
+                ingredient_atc_codes TEXT NOT NULL,
                 match_method TEXT NOT NULL,
                 UNIQUE (product_id, position)
             );
@@ -2733,10 +3205,28 @@ def _write_database(path: Path, frames: dict[str, pd.DataFrame]) -> None:
                 eml_section TEXT NOT NULL,
                 formulations TEXT NOT NULL,
                 indication TEXT NOT NULL,
+                raw_atc_codes TEXT NOT NULL,
                 atc_codes TEXT NOT NULL,
                 combined_with TEXT NOT NULL,
                 source_status TEXT NOT NULL,
                 UNIQUE (universe_id, source_ordinal)
+            );
+            CREATE TABLE eml_atc_issues (
+                issue_id TEXT PRIMARY KEY,
+                entry_id TEXT NOT NULL REFERENCES essential_medicine_entries(entry_id),
+                medicine_name TEXT NOT NULL,
+                raw_atc_code TEXT NOT NULL,
+                canonical_atc_code TEXT NOT NULL,
+                issue_state TEXT NOT NULL CHECK (issue_state IN ('corrected', 'invalid'))
+            );
+            CREATE TABLE eml_scope_classifications (
+                scope_id TEXT PRIMARY KEY,
+                universe_id TEXT NOT NULL REFERENCES essential_medicine_sets(universe_id),
+                substance_id TEXT NOT NULL REFERENCES substances(substance_id),
+                preferred_name TEXT NOT NULL,
+                scope_category TEXT NOT NULL,
+                evidence_note TEXT NOT NULL,
+                UNIQUE (universe_id, substance_id, scope_category)
             );
             CREATE TABLE essential_medicine_members (
                 entry_id TEXT NOT NULL REFERENCES essential_medicine_entries(entry_id),
@@ -2744,6 +3234,26 @@ def _write_database(path: Path, frames: dict[str, pd.DataFrame]) -> None:
                 member_role TEXT NOT NULL,
                 PRIMARY KEY (entry_id, substance_id, member_role)
             );
+            CREATE TABLE eml_product_adjudications (
+                adjudication_id TEXT PRIMARY KEY,
+                universe_id TEXT NOT NULL REFERENCES essential_medicine_sets(universe_id),
+                country_code TEXT NOT NULL REFERENCES countries(country_code),
+                target_substance_id TEXT NOT NULL REFERENCES substances(substance_id),
+                target_key TEXT NOT NULL,
+                product_id TEXT NOT NULL REFERENCES registered_products(product_id),
+                decision_state TEXT NOT NULL
+                    CHECK (decision_state IN ('VERIFIED_PRESENT', 'INDETERMINATE')),
+                rule TEXT NOT NULL,
+                mode_override TEXT NOT NULL
+                    CHECK (mode_override IN ('', 'STANDALONE', 'COMBO_ONLY')),
+                evidence_note TEXT NOT NULL,
+                needs_external_source TEXT NOT NULL,
+                UNIQUE (universe_id, country_code, target_substance_id, product_id, rule)
+            );
+            CREATE INDEX eml_product_adjudications_lookup_idx
+                ON eml_product_adjudications(
+                    universe_id, country_code, target_substance_id, decision_state
+                );
             CREATE TABLE substance_identity_uncertainties (
                 uncertainty_id TEXT PRIMARY KEY,
                 universe_id TEXT NOT NULL REFERENCES essential_medicine_sets(universe_id),
@@ -2817,7 +3327,7 @@ def _write_views_and_report(
     extraction_date: date,
     country_codes: tuple[str, ...],
     universe_id: str,
-) -> tuple[dict[str, Path], dict[str, str], Path, str]:
+) -> tuple[dict[str, Path], dict[str, str], Path, str, Path, Path]:
     comparison = compare_atlas(database_path, country_codes, universe_id)
     current_comparison = (
         compare_atlas(
@@ -2930,6 +3440,9 @@ def _write_views_and_report(
         )
 
     overlap_count = int(comparison.summary["all_selected_present"].sum())
+    standalone_overlap_count = int(
+        comparison.summary["standalone_in_all_selected"].sum()
+    )
     current_overlap_count = (
         int(current_comparison.summary["all_selected_present"].sum())
         if current_comparison is not None
@@ -2937,6 +3450,11 @@ def _write_views_and_report(
     )
     bd_bt_overlap_count = (
         int(bd_bt_comparison.summary["all_selected_present"].sum())
+        if bd_bt_comparison is not None
+        else None
+    )
+    bd_bt_standalone_count = (
+        int(bd_bt_comparison.summary["standalone_in_all_selected"].sum())
         if bd_bt_comparison is not None
         else None
     )
@@ -2975,7 +3493,8 @@ def _write_views_and_report(
         f"- Build ID: `{build_id}`",
         f"- Extraction date: `{extraction_date.isoformat()}`",
         f"- Universe: `{universe_id}` ({universe_count} normalized medicine identities)",
-        f"- Listed in all {len(country_codes)} selected country snapshots: **{overlap_count}**",
+        f"- Source-snapshot observation in all {len(country_codes)} selected countries: **{overlap_count}**",
+        f"- Standalone in all {len(country_codes)} selected countries: **{standalone_overlap_count}**",
         *(
             [
                 "- Present in all selected countries when Bhutan is restricted to "
@@ -2986,14 +3505,15 @@ def _write_views_and_report(
         ),
         *(
             [
-                f"- Bangladesh–Bhutan listed EML overlap: **{bd_bt_overlap_count}**",
+                f"- Bangladesh–Bhutan source-snapshot EML overlap: **{bd_bt_overlap_count}**",
+                f"- Bangladesh–Bhutan standalone in both: **{bd_bt_standalone_count}**",
                 "- Bangladesh–Bhutan overlap with Bhutan current-qualified: "
                 f"**{bd_bt_current_overlap_count}**",
             ]
             if bd_bt_overlap_count is not None
             else []
         ),
-        "- Primary comparison basis: listed presence in each accepted source snapshot.",
+        "- Primary comparison basis: source-snapshot observation in each accepted source; this is not a claim of current availability.",
         "- The Bhutan current-qualified comparison is a separate sensitivity view. It is "
         "not symmetric with Bangladesh, whose source has no reliable current-status fields.",
         *(
@@ -3162,9 +3682,415 @@ def _write_views_and_report(
             "",
         ]
     )
+    external_source_counts: dict[str, int] = {}
+    for value in comparison.long["needs_external_source"].astype(str):
+        for source in filter(None, value.split("|")):
+            external_source_counts[source] = external_source_counts.get(source, 0) + 1
+    scope_counts = (
+        comparison.long.loc[comparison.long["observation"].eq("OUT_OF_SCOPE")]
+        .drop_duplicates(["substance_id", "scope_status"])["scope_status"]
+        .value_counts()
+        .sort_index()
+        .to_dict()
+    )
+    marketing_counts = (
+        comparison.long.groupby(["country_code", "current_marketing"])
+        .size()
+        .to_dict()
+    )
+    report_lines.extend(
+        [
+            "",
+            "## Source-snapshot observation and current status",
+            "",
+            "Source-snapshot observation is the primary atlas signal. Current authorization and Current marketing are separate fields and remain `UNKNOWN` where the selected source cannot answer them.",
+            "",
+            "| Country | Current marketing state | EML identity count |",
+            "|---|---|---:|",
+            *[
+                f"| {country} | `{state}` | {count} |"
+                for (country, state), count in sorted(marketing_counts.items())
+            ],
+            "",
+            "## needs_external_source buckets",
+            "",
+            *(
+                ["| Missing source | Country-identity rows |", "|---|---:|"]
+                + [
+                    f"| `{source}` | {count} |"
+                    for source, count in sorted(external_source_counts.items())
+                ]
+                if external_source_counts
+                else ["No external-source requirements were emitted."]
+            ),
+            "",
+            "## OUT_OF_SCOPE buckets",
+            "",
+            *(
+                ["| Scope category | EML identities |", "|---|---:|"]
+                + [
+                    f"| `{category}` | {count} |"
+                    for category, count in sorted(scope_counts.items())
+                ]
+                if scope_counts
+                else ["No out-of-scope EML identities were emitted."]
+            ),
+        ]
+    )
+
+    verification_evidence = _build_verification_evidence(staging, comparison)
+    verification_evidence_path = staging / "verification_evidence.csv"
+    verification_evidence_path.write_bytes(_csv_bytes(verification_evidence))
+    verification_report_path = staging / "verification_report.md"
+    verification_report_path.write_text(
+        _render_verification_report(
+            build_id=build_id,
+            extraction_date=extraction_date,
+            country_codes=country_codes,
+            comparison=comparison,
+            bd_bt_comparison=bd_bt_comparison,
+            evidence=verification_evidence,
+        ),
+        encoding="utf-8",
+    )
+
     report_path = staging / "data_quality_report.md"
     report_path.write_text("\n".join(report_lines), encoding="utf-8")
-    return view_paths, view_hashes, report_path, _file_hash(report_path)
+    return (
+        view_paths,
+        view_hashes,
+        report_path,
+        _file_hash(report_path),
+        verification_report_path,
+        verification_evidence_path,
+    )
+
+
+def _build_verification_evidence(
+    staging: Path, comparison: ComparisonResult
+) -> pd.DataFrame:
+    columns = [
+        "finding_group",
+        "decision_state",
+        "country_code",
+        "target_identity",
+        "source_product_key",
+        "product_name",
+        "raw_ingredient_text",
+        "form",
+        "strength",
+        "evidence_citation",
+        "rule",
+        "evidence_note",
+        "needs_external_source",
+    ]
+    tables_dir = staging / "tables"
+
+    def read_table(name: str) -> pd.DataFrame:
+        return pd.read_csv(tables_dir / f"{name}.csv", dtype=str).fillna("")
+
+    products = read_table("registered_products")
+    ingredients = read_table("product_ingredients")
+    substances = read_table("substances")
+    ingest_issues = read_table("ingest_issues")
+    concept_adjudications = read_table("eml_product_adjudications")
+    scope_classifications = read_table("eml_scope_classifications")
+    eml_atc_issues = read_table("eml_atc_issues")
+
+    product_citation = {
+        row.product_id: f"tables/registered_products.csv:{line}"
+        for line, row in enumerate(products.itertuples(index=False), start=2)
+    }
+    scope_citation = {
+        row.scope_id: f"tables/eml_scope_classifications.csv:{line}"
+        for line, row in enumerate(scope_classifications.itertuples(index=False), start=2)
+    }
+    eml_atc_citation = {
+        row.issue_id: f"tables/eml_atc_issues.csv:{line}"
+        for line, row in enumerate(eml_atc_issues.itertuples(index=False), start=2)
+    }
+    long_citation = {
+        (row.substance_id, row.country_code): f"views/eml_presence_long.csv:{line}"
+        for line, row in enumerate(comparison.long.itertuples(index=False), start=2)
+    }
+    product_for = products.set_index("product_id").to_dict("index")
+    substance_for = substances.set_index("substance_id")[
+        "normalized_ingredient_key"
+    ].to_dict()
+    rows: list[dict[str, str]] = []
+
+    def add(**values: object) -> None:
+        rows.append({column: str(values.get(column, "") or "") for column in columns})
+
+    veterinary_products = products.loc[
+        products["exclusion_reason"].eq("outside_human_scope_veterinary")
+    ]
+    veterinary_ingredients = ingredients.merge(
+        veterinary_products[
+            [
+                "product_id",
+                "country_code",
+                "source_product_key",
+                "product_name",
+                "raw_ingredient_text",
+                "form",
+                "strength",
+            ]
+        ],
+        on="product_id",
+        how="inner",
+    )
+    for row in veterinary_ingredients.itertuples(index=False):
+        add(
+            finding_group="A_veterinary_contamination",
+            decision_state="EXCLUDED_FROM_HUMAN_PRESENCE",
+            country_code=row.country_code,
+            target_identity=substance_for.get(row.substance_id, ""),
+            source_product_key=row.source_product_key,
+            product_name=row.product_name,
+            raw_ingredient_text=row.raw_ingredient_text,
+            form=row.form,
+            strength=row.strength,
+            evidence_citation=product_citation.get(row.product_id, ""),
+            rule="outside_human_scope_veterinary",
+            evidence_note="Veterinary marker observed; product retained but excluded from human presence.",
+        )
+
+    refined = ingredients.loc[
+        ingredients["match_method"].eq("atlas_identity_refinement")
+    ]
+    for row in refined.itertuples(index=False):
+        product = product_for.get(row.product_id, {})
+        add(
+            finding_group="B_chemical_identity",
+            decision_state="RESOLVED",
+            country_code=product.get("country_code", ""),
+            target_identity=substance_for.get(row.substance_id, ""),
+            source_product_key=product.get("source_product_key", ""),
+            product_name=product.get("product_name", ""),
+            raw_ingredient_text=row.raw_component,
+            form=product.get("form", ""),
+            strength=product.get("strength", ""),
+            evidence_citation=product_citation.get(row.product_id, ""),
+            rule="atlas_identity_refinement",
+            evidence_note="Raw ingredient text preserved an identity-bearing portion removed by the core normalizer.",
+        )
+
+    reviewed_equivalences = ingredients.loc[
+        ingredients["match_method"].eq("atlas_reviewed_equivalence")
+    ]
+    for row in reviewed_equivalences.itertuples(index=False):
+        product = product_for.get(row.product_id, {})
+        add(
+            finding_group="E_reviewed_spelling_equivalence",
+            decision_state="RESOLVED",
+            country_code=product.get("country_code", ""),
+            target_identity=substance_for.get(row.substance_id, ""),
+            source_product_key=product.get("source_product_key", ""),
+            product_name=product.get("product_name", ""),
+            raw_ingredient_text=row.raw_component,
+            form=product.get("form", ""),
+            strength=product.get("strength", ""),
+            evidence_citation=product_citation.get(row.product_id, ""),
+            rule="atlas_reviewed_equivalence",
+            evidence_note="Source spelling was resolved through an explicit reviewed equivalence family.",
+        )
+
+    for row in concept_adjudications.itertuples(index=False):
+        product = product_for.get(row.product_id, {})
+        group = (
+            "C_vaccines_biologics"
+            if "vaccine" in row.target_key
+            else "D_curated_eml_concepts"
+        )
+        add(
+            finding_group=group,
+            decision_state=row.decision_state,
+            country_code=row.country_code,
+            target_identity=row.target_key,
+            source_product_key=product.get("source_product_key", ""),
+            product_name=product.get("product_name", ""),
+            raw_ingredient_text=product.get("raw_ingredient_text", ""),
+            form=product.get("form", ""),
+            strength=product.get("strength", ""),
+            evidence_citation=product_citation.get(row.product_id, ""),
+            rule=row.rule,
+            evidence_note=row.evidence_note,
+            needs_external_source=row.needs_external_source,
+        )
+
+    for row in scope_classifications.itertuples(index=False):
+        add(
+            finding_group="C_out_of_scope_objects",
+            decision_state="OUT_OF_SCOPE",
+            target_identity=row.preferred_name,
+            evidence_citation=scope_citation.get(row.scope_id, ""),
+            rule=row.scope_category,
+            evidence_note=row.evidence_note,
+        )
+
+    product_atc_issues = ingest_issues.loc[
+        ingest_issues["issue_code"].isin(
+            {"invalid_product_atc", "corrected_product_atc"}
+        )
+    ]
+    product_lookup = products.set_index(
+        ["country_code", "source_product_key"]
+    ).to_dict("index")
+    for row in product_atc_issues.itertuples(index=False):
+        product = product_lookup.get((row.country_code, row.source_product_key), {})
+        add(
+            finding_group="G_atc_hygiene",
+            decision_state=row.issue_code.removesuffix("_product_atc").upper(),
+            country_code=row.country_code,
+            source_product_key=row.source_product_key,
+            product_name=product.get("product_name", ""),
+            raw_ingredient_text=product.get("raw_ingredient_text", ""),
+            form=product.get("form", ""),
+            strength=product.get("strength", ""),
+            evidence_citation=product_citation.get(product.get("product_id", ""), ""),
+            rule=row.issue_code,
+            evidence_note=row.detail,
+        )
+    for row in eml_atc_issues.itertuples(index=False):
+        add(
+            finding_group="G_atc_hygiene",
+            decision_state=row.issue_state.upper(),
+            target_identity=row.medicine_name,
+            evidence_citation=eml_atc_citation.get(row.issue_id, ""),
+            rule="eml_atc_validation",
+            evidence_note=(
+                f"raw={row.raw_atc_code}; canonical={row.canonical_atc_code}"
+            ),
+        )
+
+    for row in comparison.long.itertuples(index=False):
+        citation = long_citation[(row.substance_id, row.country_code)]
+        if row.needs_external_source:
+            for source in row.needs_external_source.split("|"):
+                add(
+                    finding_group="verification_external_source",
+                    decision_state=row.observation,
+                    country_code=row.country_code,
+                    target_identity=row.preferred_name,
+                    evidence_citation=citation,
+                    rule=row.uncertainty_reason or "current_status_not_supported",
+                    evidence_note=row.evidence_note,
+                    needs_external_source=source,
+                )
+        if row.current_marketing == "NOT_MARKETED":
+            add(
+                finding_group="F_current_marketing",
+                decision_state="NOT_MARKETED",
+                country_code=row.country_code,
+                target_identity=row.preferred_name,
+                evidence_citation=citation,
+                rule="all_supporting_products_discontinued",
+                evidence_note=row.evidence_note,
+            )
+
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["finding_group", "country_code", "target_identity", "source_product_key"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+
+def _render_verification_report(
+    *,
+    build_id: str,
+    extraction_date: date,
+    country_codes: tuple[str, ...],
+    comparison: ComparisonResult,
+    bd_bt_comparison: ComparisonResult | None,
+    evidence: pd.DataFrame,
+) -> str:
+    four_overlap = int(comparison.summary["all_selected_present"].sum())
+    four_standalone = int(
+        comparison.summary["standalone_in_all_selected"].sum()
+    )
+    bd_bt_overlap = (
+        int(bd_bt_comparison.summary["all_selected_present"].sum())
+        if bd_bt_comparison is not None
+        else 0
+    )
+    bd_bt_standalone = (
+        int(bd_bt_comparison.summary["standalone_in_all_selected"].sum())
+        if bd_bt_comparison is not None
+        else 0
+    )
+    group_counts = evidence["finding_group"].value_counts().sort_index().to_dict()
+    external_counts: dict[str, int] = {}
+    for value in comparison.long["needs_external_source"].astype(str):
+        for source in filter(None, value.split("|")):
+            external_counts[source] = external_counts.get(source, 0) + 1
+    scope_counts = (
+        evidence.loc[evidence["decision_state"].eq("OUT_OF_SCOPE")]["rule"]
+        .value_counts()
+        .sort_index()
+        .to_dict()
+    )
+    lines = [
+        "# Atlas verification report",
+        "",
+        f"- Build ID: `{build_id}`",
+        f"- Extraction date: `{extraction_date.isoformat()}`",
+        f"- Countries: {', '.join(country_codes)}",
+        f"- Four-country source-snapshot overlap: **{four_overlap}**",
+        f"- Four-country standalone in all: **{four_standalone}**",
+        f"- Bangladesh–Bhutan source-snapshot overlap: **{bd_bt_overlap}**",
+        f"- Standalone in both Bangladesh and Bhutan: **{bd_bt_standalone}**",
+        "",
+        "## Finding-group disposition",
+        "",
+        "- A: veterinary products are retained as evidence but excluded from human-presence aggregation; veterinary-only support emits a transparent source-bounded absence.",
+        "- B: clinically defining salts, positional isomers, and active portions are refined at the atlas layer without changing the core normalizer.",
+        "- C: reviewed vaccine products resolve to observed presence, unsupported US CBER categories remain unknown, and non-register objects are OUT_OF_SCOPE.",
+        "- D: only the reviewed ORS, Hartmann's, insulin, pancreatic-enzyme, ESA, ferrous-salt, and oral-tretinoin concepts receive curated product matches.",
+        "- E: reviewed spelling families resolve deterministically while protected prodrugs and stereochemistry remain distinct.",
+        "- F: source-snapshot observation is separated from Current authorization and Current marketing; discontinued-only US evidence is NOT_MARKETED.",
+        "- G: ATC values are validated and corrected with product-level codes kept separate from ingredient-level codes.",
+        "",
+        "| Evidence group | Rows |",
+        "|---|---:|",
+        *[f"| `{group}` | {count} |" for group, count in group_counts.items()],
+        "",
+        "## needs_external_source buckets",
+        "",
+        "| Missing source | Country-identity rows |",
+        "|---|---:|",
+        *[f"| `{source}` | {count} |" for source, count in external_counts.items()],
+        "",
+        "## OUT_OF_SCOPE buckets",
+        "",
+        "| Category | Identities |",
+        "|---|---:|",
+        *[f"| `{category}` | {count} |" for category, count in scope_counts.items()],
+        "",
+        "## Evidence citations",
+        "",
+    ]
+    for group, group_rows in evidence.groupby("finding_group", sort=True):
+        lines.extend([f"### {group}", ""])
+        for row in group_rows.head(12).itertuples(index=False):
+            subject = row.target_identity or row.product_name or row.source_product_key
+            lines.append(
+                f"- `{row.decision_state}` {row.country_code} {subject}: "
+                f"{row.evidence_citation} ({row.rule})"
+            )
+        if len(group_rows) > 12:
+            lines.append(
+                f"- {len(group_rows) - 12} additional cited rows are in `verification_evidence.csv`."
+            )
+        lines.append("")
+    lines.extend(
+        [
+            "## Deferred scope",
+            "",
+            "A general EML formulation-concept engine and new CBER, Purple Book, patent, exclusivity, or regulator-contact sources remain separate phases. No off-patent or no-generic opportunity claim is made from this dataset.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _canonical_frame(frame: pd.DataFrame) -> pd.DataFrame:

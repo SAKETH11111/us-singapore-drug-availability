@@ -21,10 +21,20 @@ from src.atlas import (
     build_atlas,
     compare_atlas,
     render_legacy_compatibility,
+    _eeml_medicine_components,
     _select_bhutan_generic_text,
     _validate_manifest_counts,
 )
 from src.fetch_sources import fetch_sources
+from src.atlas_adjudications import (
+    adjudicate_eml_concept_product,
+    aggregate_current_marketing,
+    canonical_reviewed_identity,
+    canonicalize_atc,
+    classify_eml_scope,
+    refine_identity,
+    reviewed_equivalent,
+)
 
 
 EXTRACTION_DATE = date(2026, 7, 15)
@@ -38,6 +48,299 @@ def BuildSpec(*args, **kwargs):
 
     kwargs.setdefault("allow_unmanifested_test_fixture", True)
     return AtlasBuildSpec(*args, **kwargs)
+
+
+class AtlasAdjudicationTests(unittest.TestCase):
+    def test_identity_refinement_preserves_clinically_defining_active_portions(self):
+        cases = {
+            ("Hyoscine Butyl Bromide", "hyoscine"): "hyoscine butylbromide",
+            ("Hyoscine N-Butylbromide", "hyoscine n"): "hyoscine butylbromide",
+            ("Hyoscine Hydrobromide", "hyoscine"): "hyoscine hydrobromide",
+            ("Scopolamine", "scopolamine"): "hyoscine hydrobromide",
+            ("Disodium EDTA", "edetate"): "disodium edetate",
+            ("Disodium Edetate", "edetate"): "disodium edetate",
+            ("Sodium Calcium Edetate", "edetate"): "sodium calcium edetate",
+            ("Edetate Calcium Disodium", "edetate"): "sodium calcium edetate",
+            ("5-Aminosalicylic Acid", "aminosalicylic acid"): "mesalazine",
+            ("p-Aminosalicylic Acid", "aminosalicylic acid"): "para aminosalicylic acid",
+            ("Benzyl Benzoate", "benzyl"): "benzyl benzoate",
+            ("Potassium Permanganate", "permanganate"): "potassium permanganate",
+            ("Silver Diamine Fluoride", "silver diamine"): "silver diamine fluoride",
+        }
+
+        for (raw, normalized), expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(refine_identity(raw, normalized), expected)
+
+    def test_reviewed_equivalence_resolves_spelling_holds_without_merging_prodrugs(self):
+        equivalent_pairs = [
+            ("porcatant alfa", "poractant alfa"),
+            ("insulin glargin", "insulin glargine"),
+            ("tioguanine", "thioguanine"),
+            ("anastrozol", "anastrozole"),
+            ("enoxaprin", "enoxaparin"),
+            ("protamin", "protamine"),
+            ("metformine", "metformin"),
+            ("tenofovir disoproxil fumerate", "tenofovir disoproxil"),
+        ]
+        for left, right in equivalent_pairs:
+            with self.subTest(left=left, right=right):
+                self.assertTrue(reviewed_equivalent(left, right))
+
+        self.assertFalse(
+            reviewed_equivalent("tenofovir alafenamide", "tenofovir disoproxil")
+        )
+        self.assertFalse(reviewed_equivalent("esomeprazole", "omeprazole"))
+
+    def test_reviewed_identity_uses_one_deterministic_preferred_key(self):
+        cases = {
+            "porcatant alfa": "poractant alfa",
+            "insulin glargin": "insulin glargine",
+            "thioguanine": "tioguanine",
+            "anastrozol": "anastrozole",
+            "enoxaprin": "enoxaparin",
+            "protamin": "protamine",
+            "metformine": "metformin",
+            "esomeprazole strontium": "esomeprazole",
+            "tenofovir disoproxil fumerate": "tenofovir disoproxil",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(canonical_reviewed_identity(source), expected)
+
+        self.assertEqual(
+            canonical_reviewed_identity("tenofovir alafenamide"),
+            "tenofovir alafenamide",
+        )
+
+    def test_eeml_identity_refinement_splits_unsafe_pseudo_substances(self):
+        cases = {
+            "hyoscine butylbromide": ["hyoscine butylbromide"],
+            "hyoscine hydrobromide": ["hyoscine hydrobromide"],
+            "sodium calcium edetate": ["sodium calcium edetate"],
+            "benzyl benzoate": ["benzyl benzoate"],
+            "potassium permanganate": ["potassium permanganate"],
+            "silver diamine fluoride": ["silver diamine fluoride"],
+            "compound sodium lactate solution": ["compound sodium lactate"],
+            "oral rehydration salts": ["oral rehydration salts"],
+            "insulin (human, short-acting)": ["human insulin short acting"],
+            "insulin (human, intermediate-acting)": ["human insulin intermediate acting"],
+            "insulin (analogue, rapid-acting)": ["insulin analogue rapid acting"],
+            "insulin (analogue, long-acting)": ["insulin analogue long acting"],
+        }
+        for medicine_name, expected in cases.items():
+            with self.subTest(medicine_name=medicine_name):
+                self.assertEqual(_eeml_medicine_components(medicine_name), expected)
+
+    def test_scope_classification_covers_non_drug_register_object_classes(self):
+        cases = {
+            "whole blood": "blood_component",
+            "red blood cells": "blood_component",
+            "male condom": "barrier_device",
+            "dental glass ionomer cement": "dental_material",
+            "ready-to-use therapeutic food": "therapeutic_food",
+            "sunscreen": "topical_protective_product",
+            "resin-based composite (low-viscosity)": "dental_material",
+            "copper-containing intrauterine device": "contraceptive_device",
+        }
+        for medicine_name, expected in cases.items():
+            with self.subTest(medicine_name=medicine_name):
+                self.assertEqual(classify_eml_scope(medicine_name, ""), expected)
+
+        self.assertEqual(classify_eml_scope("amoxicillin", ""), "")
+
+    def test_atc_hygiene_corrects_known_errors_and_rejects_placeholders(self):
+        self.assertEqual(canonicalize_atc("A01BA02"), ("A10BA02", "corrected"))
+        self.assertEqual(canonicalize_atc("A10AC01", "insulin (human, short-acting)"), ("A10AB01", "corrected"))
+        self.assertEqual(canonicalize_atc("J01CR02"), ("J01CR02", "valid"))
+        self.assertEqual(canonicalize_atc("J 01 CR 02"), ("J01CR02", "corrected"))
+        self.assertEqual(canonicalize_atc("NOT AVAILABL"), ("", "invalid"))
+        self.assertEqual(canonicalize_atc("PENDING"), ("", "invalid"))
+
+    def test_current_marketing_requires_every_supporting_status_to_be_known(self):
+        self.assertEqual(aggregate_current_marketing(["Discontinued"]), "NOT_MARKETED")
+        self.assertEqual(
+            aggregate_current_marketing(["Discontinued", ""]), "UNKNOWN"
+        )
+        self.assertEqual(
+            aggregate_current_marketing(["Discontinued", "Prescription"]),
+            "CONFIRMED",
+        )
+
+    def test_curated_concept_adjudication_is_product_and_formulation_specific(self):
+        present = adjudicate_eml_concept_product(
+            "oral rehydration salts",
+            country_code="BD",
+            product_name="ORS (Oral Rehydration Salts)",
+            raw_ingredient_text=(
+                "Anhydrous Glucose + Potassium Chloride + Sodium Chloride + "
+                "Trisodium Citrate"
+            ),
+            form="Oral Saline",
+            strength="",
+            product_atc_codes="",
+            ingredient_keys=frozenset(
+                {"glucose", "potassium chloride", "sodium chloride", "trisodium citrate"}
+            ),
+        )
+        self.assertEqual(present.state, "VERIFIED_PRESENT")
+
+        bd_pancreatin = adjudicate_eml_concept_product(
+            "pancreatic enzymes",
+            country_code="BD",
+            product_name="Pancreon 10000 Capsule",
+            raw_ingredient_text="Pancreatin 150 mg",
+            form="Capsule",
+            strength="",
+            product_atc_codes="",
+            ingredient_keys=frozenset({"pancreatin"}),
+        )
+        self.assertEqual(bd_pancreatin.state, "INDETERMINATE")
+        self.assertEqual(bd_pancreatin.needs_external_source, "ACTIVITY_UNIT_CONFIRMATION")
+
+        oral_tretinoin = adjudicate_eml_concept_product(
+            "all trans retinoic acid",
+            country_code="SG",
+            product_name="VESANOID CAPSULE 10 mg",
+            raw_ingredient_text="TRETINOIN",
+            form="CAPSULE",
+            strength="10 mg",
+            product_atc_codes="L01XX14",
+            ingredient_keys=frozenset({"tretinoin"}),
+        )
+        topical_tretinoin = adjudicate_eml_concept_product(
+            "all trans retinoic acid",
+            country_code="BD",
+            product_name="Trinon",
+            raw_ingredient_text="Tretinoin 25 mg/100 gm",
+            form="Cream",
+            strength="",
+            product_atc_codes="",
+            ingredient_keys=frozenset({"tretinoin"}),
+        )
+        self.assertEqual(oral_tretinoin.state, "VERIFIED_PRESENT")
+        self.assertIsNone(topical_tretinoin)
+
+        long_acting = adjudicate_eml_concept_product(
+            "insulin analogue long acting",
+            country_code="BD",
+            product_name="Insul Glargine",
+            raw_ingredient_text="Insulin Glargin 100 IU/ml",
+            form="Injection",
+            strength="",
+            product_atc_codes="",
+            ingredient_keys=frozenset({"insulin glargine"}),
+        )
+        rapid_acting = adjudicate_eml_concept_product(
+            "insulin analogue rapid acting",
+            country_code="BD",
+            product_name="Insul Glargine",
+            raw_ingredient_text="Insulin Glargin 100 IU/ml",
+            form="Injection",
+            strength="",
+            product_atc_codes="",
+            ingredient_keys=frozenset({"insulin glargine"}),
+        )
+        self.assertEqual(long_acting.state, "VERIFIED_PRESENT")
+        self.assertIsNone(rapid_acting)
+
+        bt_bcg = adjudicate_eml_concept_product(
+            "bcg vaccine",
+            country_code="BT",
+            product_name="",
+            raw_ingredient_text="Live attenuated Bacille Calmette-Guérin Vaccine",
+            form="",
+            strength="",
+            product_atc_codes="",
+            ingredient_keys=frozenset({"bacille calmette guerin vaccine"}),
+        )
+        self.assertEqual(bt_bcg.state, "VERIFIED_PRESENT")
+
+        us_short = adjudicate_eml_concept_product(
+            "human insulin short acting",
+            country_code="US",
+            product_name="HUMULIN R",
+            raw_ingredient_text="INSULIN HUMAN",
+            form="SOLUTION;SUBCUTANEOUS",
+            strength="100 UNITS/ML",
+            product_atc_codes="",
+            ingredient_keys=frozenset({"insulin"}),
+        )
+        self.assertEqual(us_short.state, "VERIFIED_PRESENT")
+
+        non_dengue = adjudicate_eml_concept_product(
+            "dengue vaccine",
+            country_code="SG",
+            product_name="ACAM2000",
+            raw_ingredient_text="LIVE VACCINIA VIRUS",
+            form="INJECTION",
+            strength="",
+            product_atc_codes="J07BX",
+            ingredient_keys=frozenset({"vaccinia virus"}),
+        )
+        shingles = adjudicate_eml_concept_product(
+            "varicella vaccine",
+            country_code="SG",
+            product_name="SHINGRIX",
+            raw_ingredient_text="Recombinant Varicella Zoster Virus glycoprotein E",
+            form="INJECTION",
+            strength="",
+            product_atc_codes="J07BK",
+            ingredient_keys=frozenset({"recombinant varicella zoster virus glycoprotein e"}),
+        )
+        self.assertIsNone(non_dengue)
+        self.assertIsNone(shingles)
+
+        lispro_protamine = adjudicate_eml_concept_product(
+            "human insulin intermediate acting",
+            country_code="SG",
+            product_name="INSULIN LISPRO PROTAMINE",
+            raw_ingredient_text="INSULIN LISPRO PROTAMINE SUSPENSION",
+            form="INJECTION",
+            strength="100 IU/ml",
+            product_atc_codes="A10AC04",
+            ingredient_keys=frozenset({"insulin lispro protamine"}),
+        )
+        self.assertIsNone(lispro_protamine)
+
+        human_premix = adjudicate_eml_concept_product(
+            "human insulin intermediate acting",
+            country_code="SG",
+            product_name="MIXTARD 30",
+            raw_ingredient_text=(
+                "Insulin human (as isophane insulin) && "
+                "Insulin human (as soluble insulin)"
+            ),
+            form="INJECTION",
+            strength="70 IU/ml && 30 IU/ml",
+            product_atc_codes="A10AD01",
+            ingredient_keys=frozenset({"insulin"}),
+        )
+        self.assertEqual(human_premix.state, "VERIFIED_PRESENT")
+        self.assertEqual(human_premix.mode_override, "COMBO_ONLY")
+
+        hartmann_superset = adjudicate_eml_concept_product(
+            "compound sodium lactate",
+            country_code="US",
+            product_name="DEXTROSE 5% IN LACTATED RINGER'S",
+            raw_ingredient_text=(
+                "CALCIUM CHLORIDE; DEXTROSE; POTASSIUM CHLORIDE; "
+                "SODIUM CHLORIDE; SODIUM LACTATE"
+            ),
+            form="INJECTABLE;INJECTION",
+            strength="",
+            product_atc_codes="",
+            ingredient_keys=frozenset(
+                {
+                    "calcium chloride",
+                    "glucose",
+                    "potassium chloride",
+                    "sodium chloride",
+                    "sodium lactate",
+                }
+            ),
+        )
+        self.assertIsNone(hartmann_superset)
 
 
 def write_tsv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -529,6 +832,52 @@ class CountryAdapterContractTests(unittest.TestCase):
             set(batch.ingredients["normalized_ingredient_key"]),
             {"amoxicillin", "metformin"},
         )
+        products = batch.products.set_index("source_product_key")
+        self.assertEqual(products.loc["SG2", "raw_product_atc_codes"], "Pending")
+        self.assertEqual(products.loc["SG2", "product_atc_codes"], "")
+        self.assertIn("invalid_product_atc", set(batch.issues["issue_code"]))
+
+    def test_hsa_product_atc_is_not_assigned_to_each_combo_ingredient(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            raw = root / "data" / "raw" / "hsa"
+            source = pd.read_csv(
+                raw / "hsa_registered_therapeutic_products.csv", dtype=str
+            ).fillna("")
+            source.loc[0, "active_ingredients"] = (
+                "AMOXICILLIN TRIHYDRATE && CLAVULANATE POTASSIUM"
+            )
+            source.loc[0, "atc_code"] = "J01CR02"
+            source.to_csv(raw / "hsa_registered_therapeutic_products.csv", index=False)
+            batch = HsaAdapter().stage(raw, EXTRACTION_DATE)
+
+        product = batch.products.set_index("source_product_key").loc["SG1"]
+        self.assertEqual(product["product_atc_codes"], "J01CR02")
+        ingredient_codes = batch.ingredients.loc[
+            batch.ingredients["source_product_key"].eq("SG1"),
+            "ingredient_atc_codes",
+        ]
+        self.assertEqual(set(ingredient_codes), {""})
+
+    def test_hsa_adapter_preserves_valid_components_of_multi_code_atc(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            raw = root / "data" / "raw" / "hsa"
+            source = pd.read_csv(
+                raw / "hsa_registered_therapeutic_products.csv", dtype=str
+            ).fillna("")
+            source.loc[0, "atc_code"] = "C01BB01&&N01BB02"
+            source.loc[1, "atc_code"] = "N04BB01&&Pending"
+            source.to_csv(raw / "hsa_registered_therapeutic_products.csv", index=False)
+            batch = HsaAdapter().stage(raw, EXTRACTION_DATE)
+
+        products = batch.products.set_index("source_product_key")
+        self.assertEqual(products.loc["SG1", "product_atc_codes"], "C01BB01|N01BB02")
+        self.assertEqual(products.loc["SG2", "product_atc_codes"], "N04BB01")
+        self.assertEqual(products.loc["SG2", "raw_product_atc_codes"], "N04BB01&&Pending")
+        self.assertIn("invalid_product_atc", set(batch.issues["issue_code"]))
 
     def test_hsa_adapter_fails_closed_on_truncation_and_filters_short_identity(self):
         with TemporaryDirectory() as tmp:
@@ -624,6 +973,90 @@ class CountryAdapterContractTests(unittest.TestCase):
         self.assertFalse(bool(batch.products["source_retired"].any()))
         self.assertIn("not observed", batch.policy.observed_absence_wording.lower())
         self.assertNotIn("not registered", batch.policy.observed_absence_wording.lower())
+
+    def test_bangladesh_veterinary_marker_excludes_products_from_human_presence(self):
+        concepts = [
+            {
+                "id": "vet-name",
+                "display_name": "Longtin Vet Inj",
+                "retired": False,
+                "extras": {
+                    "trade_name": "Longtin Vet Inj",
+                    "generic_content_raw": "Moxidectin 1 gm/100 ml",
+                    "dosage_form": "Injection",
+                },
+            },
+            {
+                "id": "vet-metadata",
+                "display_name": "Prazitel",
+                "retired": False,
+                "extras": {
+                    "trade_name": "Prazitel",
+                    "generic_content_raw": "Praziquantel + Pyrantel 18.2 mg + 72.6 mg",
+                    "dosage_form": "Veterinary bolus",
+                },
+            },
+            {
+                "id": "human-substring",
+                "display_name": "Carvetab",
+                "retired": False,
+                "extras": {
+                    "trade_name": "Carvetab",
+                    "generic_content_raw": "Paracetamol 500 mg",
+                    "dosage_form": "Tablet",
+                },
+            },
+            {
+                "id": "vet-brand",
+                "display_name": "Vetodex",
+                "retired": False,
+                "extras": {
+                    "trade_name": "Vetodex",
+                    "generic_content_raw": "Dexamethasone Sodium Phosphate 2 mg/ml",
+                    "dosage_form": "Injection",
+                },
+            },
+            {
+                "id": "vet-bolus",
+                "display_name": "Dirozyl",
+                "retired": False,
+                "extras": {
+                    "trade_name": "Dirozyl",
+                    "generic_content_raw": "Metronidazole 2 gm",
+                    "dosage_form": "Bolus",
+                },
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "bd"
+            raw.mkdir()
+            (raw / "dgda_concepts.json").write_text(
+                json.dumps(
+                    {
+                        "metadata": {"num_found": len(concepts)},
+                        "concepts": concepts,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            batch = BangladeshAdapter().stage(raw, EXTRACTION_DATE)
+
+        products = batch.products.set_index("source_product_key")
+        for product_key in ("vet-name", "vet-metadata", "vet-brand", "vet-bolus"):
+            with self.subTest(product_key=product_key):
+                self.assertFalse(bool(products.loc[product_key, "included_in_presence"]))
+                self.assertEqual(
+                    products.loc[product_key, "exclusion_reason"],
+                    "outside_human_scope_veterinary",
+                )
+        self.assertTrue(bool(products.loc["human-substring", "included_in_presence"]))
+        excluded_issues = batch.issues.loc[
+            batch.issues["issue_code"].eq("outside_human_scope_veterinary")
+        ]
+        self.assertEqual(
+            set(excluded_issues["source_product_key"]),
+            {"vet-name", "vet-metadata", "vet-brand", "vet-bolus"},
+        )
 
     def test_bangladesh_missing_generic_is_unresolved_not_brand_identity(self):
         with TemporaryDirectory() as tmp:
@@ -731,6 +1164,271 @@ class CountryAdapterContractTests(unittest.TestCase):
 
 
 class AtlasBuildTests(unittest.TestCase):
+    def test_build_emits_cited_verification_report_and_quality_buckets(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+
+            verification_report = artifact.verification_report_path.read_text(
+                encoding="utf-8"
+            )
+            evidence = pd.read_csv(
+                artifact.verification_evidence_path, dtype=str
+            ).fillna("")
+            quality_report = artifact.report_path.read_text(encoding="utf-8")
+
+        self.assertIn("# Atlas verification report", verification_report)
+        self.assertIn("Four-country source-snapshot overlap", verification_report)
+        self.assertIn("Bangladesh–Bhutan source-snapshot overlap", verification_report)
+        self.assertIn("Standalone in both", verification_report)
+        self.assertIn("needs_external_source", verification_report)
+        self.assertIn("OUT_OF_SCOPE", verification_report)
+        self.assertEqual(
+            set(
+                [
+                    "finding_group",
+                    "decision_state",
+                    "country_code",
+                    "target_identity",
+                    "source_product_key",
+                    "product_name",
+                    "raw_ingredient_text",
+                    "evidence_citation",
+                    "rule",
+                    "needs_external_source",
+                ]
+            ).difference(evidence.columns),
+            set(),
+        )
+        self.assertTrue(
+            evidence["evidence_citation"].str.match(r"tables/.+\.csv:\d+").any()
+        )
+        self.assertIn("Source-snapshot observation", quality_report)
+        self.assertIn("Current marketing", quality_report)
+        self.assertIn("OUT_OF_SCOPE", quality_report)
+
+    def test_build_materializes_product_backed_eml_concept_adjudications(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+
+            bd_path = root / "data" / "raw" / "bd" / "dgda_concepts.json"
+            payload = json.loads(bd_path.read_text(encoding="utf-8"))
+            for product_key, product_name, raw, form in [
+                (
+                    "bd-ors",
+                    "ORS (Oral Rehydration Salts)",
+                    "Anhydrous Glucose + Potassium Chloride + Sodium Chloride + Trisodium Citrate",
+                    "Oral Saline",
+                ),
+                ("bd-pancreatin", "Pancreon 10000", "Pancreatin 150 mg", "Capsule"),
+                ("bd-tretinoin", "Trinon", "Tretinoin 25 mg/100 gm", "Cream"),
+            ]:
+                payload["concepts"].append(
+                    {
+                        "id": product_key,
+                        "display_name": product_name,
+                        "retired": False,
+                        "extras": {
+                            "trade_name": product_name,
+                            "generic_content_raw": raw,
+                            "dosage_form": form,
+                        },
+                    }
+                )
+            payload["metadata"]["num_found"] = len(payload["concepts"])
+            payload["metadata"]["num_returned"] = len(payload["concepts"])
+            bd_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            hsa_path = (
+                root
+                / "data"
+                / "raw"
+                / "hsa"
+                / "hsa_registered_therapeutic_products.csv"
+            )
+            hsa = pd.read_csv(hsa_path, dtype=str).fillna("")
+            hsa.loc[len(hsa)] = {
+                "licence_no": "SG-VESANOID",
+                "product_name": "VESANOID CAPSULE 10 mg",
+                "approval_d": "2004-01-01",
+                "atc_code": "L01XX14",
+                "active_ingredients": "TRETINOIN",
+                "license_holder": "SG Holder",
+            }
+            hsa.to_csv(hsa_path, index=False)
+
+            eeml_path = root / "data" / "raw" / "who" / "eeml_2025.csv"
+            eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
+            for medicine_name in (
+                "oral rehydration salts",
+                "pancreatic enzymes",
+                "all-trans retinoic acid",
+            ):
+                eeml.loc[len(eeml)] = {
+                    "Medicine name": medicine_name,
+                    "EML section": "Concept fixture",
+                    "Formulations": "fixture",
+                    "Indication": "",
+                    "ATC codes": "",
+                    "Combined with": "",
+                    "Status": "Added",
+                }
+            eeml.to_csv(eeml_path, index=False)
+
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+            adjudications = pd.read_csv(
+                artifact.table_paths["eml_product_adjudications"], dtype=str
+            ).fillna("")
+
+        by_target_country = adjudications.set_index(["target_key", "country_code"])
+        self.assertEqual(
+            by_target_country.loc[("oral rehydration salts", "BD"), "decision_state"],
+            "VERIFIED_PRESENT",
+        )
+        self.assertEqual(
+            by_target_country.loc[("pancreatic enzymes", "BD"), "decision_state"],
+            "INDETERMINATE",
+        )
+        self.assertEqual(
+            by_target_country.loc[("pancreatic enzymes", "BD"), "needs_external_source"],
+            "ACTIVITY_UNIT_CONFIRMATION",
+        )
+        self.assertEqual(
+            by_target_country.loc[("all trans retinoic acid", "SG"), "decision_state"],
+            "VERIFIED_PRESENT",
+        )
+        self.assertNotIn(("all trans retinoic acid", "BD"), by_target_country.index)
+
+    def test_build_preserves_raw_eml_atc_and_emits_canonical_codes_with_issues(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            eeml_path = root / "data" / "raw" / "who" / "eeml_2025.csv"
+            eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
+            eeml.loc[eeml["Medicine name"].eq("metformin"), "ATC codes"] = "A01BA02"
+            eeml.loc[len(eeml)] = {
+                "Medicine name": "insulin (human, short-acting)",
+                "EML section": "Diabetes",
+                "Formulations": "injection",
+                "Indication": "",
+                "ATC codes": "A10AC01",
+                "Combined with": "",
+                "Status": "Added",
+            }
+            eeml.loc[len(eeml)] = {
+                "Medicine name": "invalid ATC fixture",
+                "EML section": "Fixture",
+                "Formulations": "tablet",
+                "Indication": "",
+                "ATC codes": "PENDING",
+                "Combined with": "",
+                "Status": "Added",
+            }
+            eeml.to_csv(eeml_path, index=False)
+
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+            entries = pd.read_csv(
+                artifact.table_paths["essential_medicine_entries"], dtype=str
+            ).fillna("")
+            issues = pd.read_csv(
+                artifact.table_paths["eml_atc_issues"], dtype=str
+            ).fillna("")
+
+        by_name = entries.set_index("medicine_name")
+        self.assertEqual(by_name.loc["metformin", "raw_atc_codes"], "A01BA02")
+        self.assertEqual(by_name.loc["metformin", "atc_codes"], "A10BA02")
+        self.assertEqual(
+            by_name.loc["insulin (human, short-acting)", "atc_codes"], "A10AB01"
+        )
+        self.assertEqual(by_name.loc["invalid ATC fixture", "raw_atc_codes"], "PENDING")
+        self.assertEqual(by_name.loc["invalid ATC fixture", "atc_codes"], "")
+        self.assertEqual(
+            set(issues["issue_state"]), {"corrected", "invalid"}
+        )
+
+    def test_build_applies_atlas_identity_refinement_to_source_and_eml_rows(self):
+        source_rows = [
+            ("bd-hyoscine-butyl", "Hyoscine Butyl Bromide 10 mg"),
+            ("bd-hyoscine-hydro", "Hyoscine Hydrobromide 400 mcg"),
+            ("bd-edta", "Disodium EDTA 17%"),
+            ("bd-mesalazine", "5-Aminosalicylic Acid 400 mg"),
+            ("bd-benzoate", "Benzyl Benzoate 25%"),
+            ("bd-permanganate", "Potassium Permanganate 1:10000"),
+            ("bd-sdf", "Silver Diamine Fluoride 38%"),
+        ]
+        eeml_names = [
+            "hyoscine butylbromide",
+            "hyoscine hydrobromide",
+            "sodium calcium edetate",
+            "p-aminosalicylate sodium",
+            "benzyl benzoate",
+            "potassium permanganate",
+            "silver diamine fluoride",
+        ]
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            bd_path = root / "data" / "raw" / "bd" / "dgda_concepts.json"
+            payload = json.loads(bd_path.read_text(encoding="utf-8"))
+            for product_key, raw_ingredient in source_rows:
+                payload["concepts"].append(
+                    {
+                        "id": product_key,
+                        "display_name": product_key,
+                        "retired": False,
+                        "extras": {
+                            "trade_name": product_key,
+                            "generic_content_raw": raw_ingredient,
+                            "dosage_form": "fixture",
+                        },
+                    }
+                )
+            payload["metadata"]["num_found"] = len(payload["concepts"])
+            payload["metadata"]["num_returned"] = len(payload["concepts"])
+            bd_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            eeml_path = root / "data" / "raw" / "who" / "eeml_2025.csv"
+            eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
+            for medicine_name in eeml_names:
+                eeml.loc[len(eeml)] = {
+                    "Medicine name": medicine_name,
+                    "EML section": "Identity fixture",
+                    "Formulations": "fixture",
+                    "Indication": "",
+                    "ATC codes": "",
+                    "Combined with": "",
+                    "Status": "Added",
+                }
+            eeml.to_csv(eeml_path, index=False)
+
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+            substances = pd.read_csv(artifact.table_paths["substances"], dtype=str)
+            product_ingredients = pd.read_csv(
+                artifact.table_paths["product_ingredients"], dtype=str
+            )
+            products = pd.read_csv(artifact.table_paths["registered_products"], dtype=str)
+
+        keys = set(substances["normalized_ingredient_key"])
+        expected = {
+            "hyoscine butylbromide",
+            "hyoscine hydrobromide",
+            "sodium calcium edetate",
+            "disodium edetate",
+            "para aminosalicylic acid",
+            "mesalazine",
+            "benzyl benzoate",
+            "potassium permanganate",
+            "silver diamine fluoride",
+        }
+        self.assertTrue(expected.issubset(keys))
+        joined = product_ingredients.merge(products[["product_id", "source_product_key"]])
+        substance_for = substances.set_index("substance_id")["normalized_ingredient_key"]
+        source_keys = joined.set_index("source_product_key")["substance_id"].map(substance_for)
+        self.assertEqual(source_keys.loc["bd-edta"], "disodium edetate")
+        self.assertEqual(source_keys.loc["bd-mesalazine"], "mesalazine")
+
     def test_build_fails_loudly_when_legacy_inputs_are_missing(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -816,6 +1514,9 @@ class AtlasBuildTests(unittest.TestCase):
                 first.table_paths["substances"].read_bytes(),
                 second.table_paths["substances"].read_bytes(),
             )
+            manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["schema_version"], "5")
+            self.assertRegex(manifest["adjudication_sha256"], r"^[0-9a-f]{64}$")
             with sqlite3.connect(first.database_path) as connection:
                 self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
                 application_types = {
@@ -970,6 +1671,76 @@ class AtlasBuildTests(unittest.TestCase):
 
 
 class ComparisonQueryTests(unittest.TestCase):
+    def test_comparison_separates_snapshot_presence_scope_and_current_status(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+
+            bd_path = root / "data" / "raw" / "bd" / "dgda_concepts.json"
+            payload = json.loads(bd_path.read_text(encoding="utf-8"))
+            payload["concepts"].append(
+                {
+                    "id": "bd-moxidectin-vet",
+                    "display_name": "Longtin Vet Inj",
+                    "retired": False,
+                    "extras": {
+                        "trade_name": "Longtin Vet Inj",
+                        "generic_content_raw": "Moxidectin  1 gm/100 ml",
+                        "dosage_form": "Injection",
+                    },
+                }
+            )
+            payload["metadata"]["num_found"] = len(payload["concepts"])
+            payload["metadata"]["num_returned"] = len(payload["concepts"])
+            bd_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            eeml_path = root / "data" / "raw" / "who" / "eeml_2025.csv"
+            eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
+            for medicine_name in ("moxidectin", "BCG vaccine", "whole blood"):
+                eeml.loc[len(eeml)] = {
+                    "Medicine name": medicine_name,
+                    "EML section": "Comparison fixture",
+                    "Formulations": "fixture",
+                    "Indication": "",
+                    "ATC codes": "",
+                    "Combined with": "",
+                    "Status": "Added",
+                }
+            eeml.to_csv(eeml_path, index=False)
+
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+            result = compare_atlas(artifact.database_path, ("US", "SG", "BD", "BT"))
+
+        rows = result.long.set_index(["preferred_name", "country_code"])
+        vet_only = rows.loc[("moxidectin", "BD")]
+        self.assertEqual(vet_only["observation"], "OBSERVED_ABSENCE")
+        self.assertFalse(bool(vet_only["observed_in_source_snapshot"]))
+        self.assertEqual(vet_only["current_authorization"], "UNKNOWN")
+        self.assertEqual(vet_only["current_marketing"], "UNKNOWN")
+        self.assertIn("only a veterinary product was observed", vet_only["evidence_note"])
+        self.assertIn("no human-scope product was found", vet_only["evidence_note"])
+        self.assertIn("Longtin Vet Inj", vet_only["evidence_note"])
+
+        us_vaccine = rows.loc[("bcg vaccine", "US")]
+        self.assertEqual(us_vaccine["observation"], "UNKNOWN")
+        self.assertEqual(
+            us_vaccine["needs_external_source"], "FDA_CBER_OR_PURPLE_BOOK"
+        )
+
+        whole_blood = rows.loc[("whole blood", "US")]
+        self.assertEqual(whole_blood["observation"], "OUT_OF_SCOPE")
+        self.assertEqual(whole_blood["scope_status"], "blood_component")
+        self.assertTrue(pd.isna(whole_blood["observed_in_source_snapshot"]))
+
+        discontinued = rows.loc[("paracetamol", "US")]
+        self.assertEqual(discontinued["observation"], "STANDALONE")
+        self.assertEqual(discontinued["current_marketing"], "NOT_MARKETED")
+        self.assertEqual(discontinued["current_authorization"], "UNKNOWN")
+
+        whole_blood_summary = result.summary.set_index("preferred_name").loc["whole blood"]
+        self.assertEqual(int(whole_blood_summary["determinate_country_count"]), 0)
+        self.assertFalse(bool(whole_blood_summary["all_selected_present"]))
+
     def test_real_registry_vaccine_variants_never_publish_false_absence(self):
         fixture = json.loads(REAL_SOURCE_REGRESSIONS.read_text(encoding="utf-8"))
         cases = fixture["identity_cases"]
@@ -1060,6 +1831,13 @@ class ComparisonQueryTests(unittest.TestCase):
         for case in cases:
             for target in case["eml_targets"]:
                 row = by_pair.loc[(target, case["country_code"])]
+                if (case["source_product_key"], target) in {
+                    ("SIN12099P", "cholera vaccine"),
+                    ("BHU-MPD/24/AR/H041", "bcg vaccine"),
+                }:
+                    self.assertEqual(row["observation"], "STANDALONE")
+                    self.assertEqual(row["uncertainty_reason"], "")
+                    continue
                 self.assertEqual(
                     row["observation"],
                     "UNKNOWN",
