@@ -1767,6 +1767,143 @@ class AtlasBuildTests(unittest.TestCase):
             set(issues["issue_state"]), {"corrected", "invalid"}
         )
 
+    def test_substance_atc_codes_come_from_who_index_not_source_assertions(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+
+            atc_path = root / "data" / "raw" / "who" / "atc.csv"
+            atc = pd.read_csv(atc_path, dtype=str).fillna("")
+            atc = pd.concat(
+                [
+                    atc,
+                    pd.DataFrame(
+                        [
+                            {"atc_code": "R05CB01", "atc_name": "acetylcysteine"},
+                            {"atc_code": "S01XA08", "atc_name": "acetylcysteine"},
+                            {"atc_code": "V03AB23", "atc_name": "acetylcysteine"},
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+            atc.to_csv(atc_path, index=False)
+
+            hsa_path = (
+                root
+                / "data"
+                / "raw"
+                / "hsa"
+                / "hsa_registered_therapeutic_products.csv"
+            )
+            hsa = pd.read_csv(hsa_path, dtype=str).fillna("")
+            hsa.loc[len(hsa)] = {
+                "licence_no": "SG-ACETYLCYSTEINE",
+                "product_name": "ACETYLCYSTEINE 200",
+                "approval_d": "2005-01-01",
+                "atc_code": "A01BA02",
+                "active_ingredients": "ACETYLCYSTEINE",
+                "license_holder": "SG Holder",
+            }
+            hsa.to_csv(hsa_path, index=False)
+
+            eeml_path = root / "data" / "raw" / "who" / "eeml_2025.csv"
+            eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
+            eeml.loc[len(eeml)] = {
+                "Medicine name": "acetylcysteine",
+                "EML section": "Antidotes",
+                "Formulations": "oral liquid",
+                "Indication": "",
+                "ATC codes": "A01BA02",
+                "Combined with": "",
+                "Status": "Added",
+            }
+            eeml.to_csv(eeml_path, index=False)
+
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+            substances = pd.read_csv(
+                artifact.table_paths["substances"], dtype=str
+            ).fillna("")
+            products = pd.read_csv(
+                artifact.table_paths["registered_products"], dtype=str
+            ).fillna("")
+            with sqlite3.connect(artifact.database_path) as connection:
+                canonical_codes = pd.read_sql_query(
+                    """
+                    SELECT code.atc_code
+                    FROM substance_atc_codes AS code
+                    JOIN substances AS substance USING (substance_id)
+                    WHERE substance.normalized_ingredient_key = 'acetylcysteine'
+                    ORDER BY code.atc_code
+                    """,
+                    connection,
+                )["atc_code"].tolist()
+
+            comparison_view_names = [
+                "eml_presence_long",
+                "eml_comparison_wide",
+                "eml_presence_long_bt_current_qualified",
+                "eml_comparison_wide_bt_current_qualified",
+                "bd_bt_eml_presence_long",
+                "bd_bt_eml_comparison_wide",
+                "bd_bt_eml_presence_long_bt_current_qualified",
+                "bd_bt_eml_comparison_wide_bt_current_qualified",
+            ]
+            comparison_codes = {}
+            for view_name in comparison_view_names:
+                view = pd.read_csv(artifact.view_paths[view_name], dtype=str).fillna("")
+                comparison_codes[view_name] = set(
+                    view.loc[view["preferred_name"].eq("acetylcysteine"), "atc_codes"]
+                )
+
+        expected = "R05CB01|S01XA08|V03AB23"
+        substance = substances.set_index("normalized_ingredient_key").loc[
+            "acetylcysteine"
+        ]
+        self.assertEqual(substance["atc_codes"], expected)
+        self.assertEqual(canonical_codes, expected.split("|"))
+        self.assertEqual(
+            products.set_index("source_product_key").loc[
+                "SG-ACETYLCYSTEINE", "raw_product_atc_codes"
+            ],
+            "A01BA02",
+        )
+        self.assertNotIn("A01BA02", canonical_codes)
+        self.assertNotIn("A10BA02", canonical_codes)
+        self.assertTrue(
+            all(codes == {expected} for codes in comparison_codes.values())
+        )
+
+    def test_substance_without_exact_who_atc_match_stays_empty(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+            atc_path = root / "data" / "raw" / "who" / "atc.csv"
+            atc = pd.read_csv(atc_path, dtype=str).fillna("")
+            atc.loc[len(atc)] = {
+                "atc_code": "A10BD07",
+                "atc_name": "metformin and sitagliptin",
+            }
+            atc.to_csv(atc_path, index=False)
+
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+            substances = pd.read_csv(
+                artifact.table_paths["substances"], dtype=str
+            ).fillna("")
+            with sqlite3.connect(artifact.database_path) as connection:
+                relation_count = connection.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM substance_atc_codes AS code
+                    JOIN substances AS substance USING (substance_id)
+                    WHERE substance.normalized_ingredient_key = 'metformin'
+                    """
+                ).fetchone()[0]
+
+        metformin = substances.set_index("normalized_ingredient_key").loc["metformin"]
+        self.assertEqual(metformin["atc_codes"], "")
+        self.assertEqual(relation_count, 0)
+
     def test_build_applies_atlas_identity_refinement_to_source_and_eml_rows(self):
         source_rows = [
             ("bd-hyoscine-butyl", "Hyoscine Butyl Bromide 10 mg"),
@@ -1934,7 +2071,7 @@ class AtlasBuildTests(unittest.TestCase):
                 second.table_paths["substances"].read_bytes(),
             )
             manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(manifest["schema_version"], "5")
+            self.assertEqual(manifest["schema_version"], "6")
             self.assertRegex(manifest["adjudication_sha256"], r"^[0-9a-f]{64}$")
             with sqlite3.connect(first.database_path) as connection:
                 self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])

@@ -58,6 +58,8 @@ counts must also clear conservative source-specific plausibility floors:
 
 - `atlas.sqlite`: normalized relational database with foreign keys.
 - `tables/`: deterministic CSV exports of every normalized table.
+- `tables/substances.csv`: substance metadata with canonical WHO ATC codes pipe-joined for search;
+  SQLite stores the same one-to-many mapping in `substance_atc_codes`.
 - `views/eml_presence_long.csv`: one EML ingredient by country observation.
 - `views/eml_comparison_summary.csv`: overlap, gaps, and penetration.
 - `views/eml_comparison_wide.csv`: readable US, SG, BD, and BT display.
@@ -72,6 +74,9 @@ counts must also clear conservative source-specific plausibility floors:
 ## Semantics that matter
 
 - Ingredient identity always comes from `src/normalize.py`, the canonical fixed normalizer.
+- Substance ATC codes come only from exact canonical WHO ATC index matches and reviewed ATC-name
+  aliases. National-register assertions remain on product and ingredient rows, including their raw
+  values, and never populate the substance field.
 - The atlas ingests FDA NDA, BLA, and ANDA records. The legacy US by Singapore renderer filters FDA
   to NDA/BLA before applying the historical brand deduplication, preserving its 2,923 rows and all
   20 non-EML columns exactly. Its WHO flag is intentionally refreshed from the open 2025 eEML.

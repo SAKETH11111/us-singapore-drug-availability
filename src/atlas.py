@@ -39,6 +39,7 @@ from .atlas_adjudications import (
     refine_identity,
 )
 from .normalize import (
+    atc_match_names,
     normalize_fda_component,
     normalize_ingredient,
     split_fda_ingredients,
@@ -68,7 +69,7 @@ from .sources import (
 
 
 ATLAS_NAMESPACE = uuid.UUID("186c4a4a-a3aa-5be5-968d-ce32b54e4054")
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 SUBSTANCE_IDENTITY_VERSION = "normalized-ingredient-key-v1"
 UNIVERSE_ID = "WHO_EML_2025"
 MINIMUM_DECLARED_ROWS = {
@@ -1189,6 +1190,7 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
     if fetch_manifest is not None:
         _validate_manifest_counts(fetch_manifest, batches)
     legacy_rows = _build_legacy_observations(raw_root)
+    canonical_atc_l5 = build_atc_l5_lookup(load_atc(raw_root / "who" / "atc.csv"))
 
     normalizer_path = Path(__file__).with_name("normalize.py")
     adjudication_path = Path(__file__).with_name("atlas_adjudications.py")
@@ -1242,6 +1244,7 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
         eeml_path=eeml_path,
         eeml_logical_hash=eeml_logical_hash,
         legacy_rows=legacy_rows,
+        canonical_atc_l5=canonical_atc_l5,
     )
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -1255,7 +1258,12 @@ def build_atlas(spec: BuildSpec) -> BuildArtifact:
         table_hashes: dict[str, str] = {}
         for table_name, frame in table_frames.items():
             path = tables_dir / f"{table_name}.csv"
-            canonical = _canonical_frame(frame)
+            export_frame = (
+                _substances_csv_frame(frame, table_frames["substance_atc_codes"])
+                if table_name == "substances"
+                else frame
+            )
+            canonical = _canonical_frame(export_frame)
             path.write_bytes(_csv_bytes(canonical))
             table_paths[table_name] = path
             table_hashes[table_name] = _file_hash(path)
@@ -1400,6 +1408,15 @@ def compare_atlas(
         universe = pd.read_sql_query(
             """
             SELECT s.substance_id, s.preferred_name,
+                   COALESCE((
+                       SELECT GROUP_CONCAT(atc.atc_code, '|')
+                       FROM (
+                           SELECT code.atc_code
+                           FROM substance_atc_codes AS code
+                           WHERE code.substance_id = s.substance_id
+                           ORDER BY code.atc_code
+                       ) AS atc
+                   ), '') AS atc_codes,
                    GROUP_CONCAT(DISTINCT entry.eml_section) AS eml_sections
             FROM essential_medicine_members AS member
             JOIN essential_medicine_entries AS entry USING (entry_id)
@@ -1806,6 +1823,7 @@ def compare_atlas(
                 {
                     "substance_id": substance.substance_id,
                     "preferred_name": substance.preferred_name,
+                    "atc_codes": substance.atc_codes,
                     "country_code": country_code,
                     "observation": observation,
                     "observed_in_source_snapshot": observed_in_source_snapshot,
@@ -1837,8 +1855,8 @@ def compare_atlas(
 
     summary_rows: list[dict[str, object]] = []
     present_states = {"STANDALONE", "COMBO_ONLY"}
-    for (substance_id, preferred_name), group in long.groupby(
-        ["substance_id", "preferred_name"], sort=True
+    for (substance_id, preferred_name, atc_codes), group in long.groupby(
+        ["substance_id", "preferred_name", "atc_codes"], sort=True
     ):
         accepted_count = int(group["snapshot_status"].eq("accepted").sum())
         determinate_count = int(
@@ -1850,6 +1868,7 @@ def compare_atlas(
             {
                 "substance_id": substance_id,
                 "preferred_name": preferred_name,
+                "atc_codes": atc_codes,
                 "selected_country_count": len(selected),
                 "accepted_snapshot_count": accepted_count,
                 "determinate_country_count": determinate_count,
@@ -1904,6 +1923,7 @@ def compare_atlas(
                 [
                     "preferred_name",
                     "substance_id",
+                    "atc_codes",
                     "observation",
                     "standalone_product_count",
                     "combo_product_count",
@@ -1918,7 +1938,10 @@ def compare_atlas(
                 }
             )
             wide = wide.merge(
-                country, on=["substance_id", "preferred_name"], how="left", sort=False
+                country,
+                on=["substance_id", "preferred_name", "atc_codes"],
+                how="left",
+                sort=False,
             )
         wide = wide.sort_values("preferred_name", kind="stable").reset_index(drop=True)
     else:
@@ -2559,6 +2582,73 @@ def _excel_column_index(letters: str) -> int:
     return result - 1
 
 
+def _build_substance_atc_codes(
+    substances: pd.DataFrame, canonical_atc_l5: pd.DataFrame
+) -> pd.DataFrame:
+    """Match substances to canonical WHO L5 codes without source-code fallback."""
+
+    columns = ["substance_id", "atc_code"]
+    if substances.empty or canonical_atc_l5.empty:
+        return pd.DataFrame(columns=columns)
+
+    atc_index = canonical_atc_l5[["atc_code", "atc_name", "name_norm"]].copy()
+    atc_index["canonical_substance_key"] = atc_index.apply(
+        lambda row: refine_identity(row["atc_name"], row["name_norm"]), axis=1
+    )
+    atc_index = atc_index[
+        atc_index["canonical_substance_key"].fillna("").astype(str).str.len().ge(3)
+    ].drop_duplicates(["atc_code", "canonical_substance_key"])
+
+    candidate_rows: list[dict[str, str]] = []
+    for substance in substances.itertuples(index=False):
+        substance_key = str(substance.normalized_ingredient_key)
+        match_keys = [substance_key]
+        if normalize_ingredient(substance_key) == substance_key:
+            match_keys.extend(atc_match_names(substance_key))
+        for match_key in dict.fromkeys(match_keys):
+            candidate_rows.append(
+                {
+                    "substance_id": str(substance.substance_id),
+                    "canonical_substance_key": match_key,
+                }
+            )
+
+    matches = pd.DataFrame(candidate_rows).merge(
+        atc_index[["atc_code", "canonical_substance_key"]],
+        on="canonical_substance_key",
+        how="inner",
+        sort=False,
+    )
+    return (
+        matches[columns]
+        .drop_duplicates()
+        .sort_values(columns, kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def _substances_csv_frame(
+    substances: pd.DataFrame, substance_atc_codes: pd.DataFrame
+) -> pd.DataFrame:
+    """Render the normalized SQLite ATC relation as a CSV search field."""
+
+    exported = substances.copy()
+    if substance_atc_codes.empty:
+        exported["atc_codes"] = ""
+        return exported
+    joined_codes = (
+        substance_atc_codes.sort_values(["substance_id", "atc_code"], kind="stable")
+        .groupby("substance_id", sort=False)["atc_code"]
+        .agg("|".join)
+        .rename("atc_codes")
+    )
+    exported = exported.merge(
+        joined_codes, left_on="substance_id", right_index=True, how="left", sort=False
+    )
+    exported["atc_codes"] = exported["atc_codes"].fillna("")
+    return exported
+
+
 def _build_table_frames(
     *,
     build_id: str,
@@ -2572,6 +2662,7 @@ def _build_table_frames(
     eeml_path: Path,
     eeml_logical_hash: str,
     legacy_rows: pd.DataFrame,
+    canonical_atc_l5: pd.DataFrame,
 ) -> dict[str, pd.DataFrame]:
     country_names = {
         "US": "United States",
@@ -2776,6 +2867,9 @@ def _build_table_frames(
             }
             for key in all_substance_keys
         ]
+    )
+    substance_atc_codes = _build_substance_atc_codes(
+        substances, canonical_atc_l5
     )
 
     product_ingredients = staged_ingredients.copy()
@@ -3149,6 +3243,7 @@ def _build_table_frames(
         "countries": countries,
         "source_snapshots": source_snapshots,
         "substances": substances,
+        "substance_atc_codes": substance_atc_codes,
         "registered_products": registered_products,
         "product_ingredients": product_ingredients,
         "essential_medicine_sets": essential_medicine_sets,
@@ -3212,6 +3307,13 @@ def _write_database(path: Path, frames: dict[str, pd.DataFrame]) -> None:
                 unii TEXT NOT NULL,
                 identity_basis TEXT NOT NULL
             );
+            CREATE TABLE substance_atc_codes (
+                substance_id TEXT NOT NULL REFERENCES substances(substance_id),
+                atc_code TEXT NOT NULL,
+                PRIMARY KEY (substance_id, atc_code)
+            );
+            CREATE INDEX substance_atc_codes_code_idx
+                ON substance_atc_codes(atc_code, substance_id);
             CREATE TABLE registered_products (
                 product_id TEXT PRIMARY KEY,
                 snapshot_id TEXT NOT NULL REFERENCES source_snapshots(snapshot_id),

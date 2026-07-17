@@ -11,7 +11,8 @@ and accepted source snapshots.
 | `build_runs` | one deterministic build | Extraction date, schema version, and universe |
 | `countries` | one country | Stable ISO-like country code and display name |
 | `source_snapshots` | one country source in a build | URLs, capture/source-as-of dates, acceptance reason, row counts, source hash, coverage, absence wording, licence status, and attribution |
-| `substances` | one normalized ingredient identity | Deterministic ID, canonical normalized key, display name, identity basis, and optional UNII anchor |
+| `substances` | one normalized ingredient identity | Deterministic ID, canonical normalized key, display name, identity basis, and optional UNII anchor; its CSV export adds pipe-joined canonical ATC codes |
+| `substance_atc_codes` | one canonical WHO ATC code for one substance | Searchable one-to-many substance classification sourced only from the WHO ATC index |
 | `registered_products` | one normalized source product | Country, source key, declared/resolved component counts, application type, dates/status evidence, and scope flags |
 | `product_ingredients` | one ingredient in one product | Ingredient position, raw text/strength, normalized substance, and optional ATC metadata |
 | `essential_medicine_sets` | one named universe | Edition, source, logical hash, and license |
@@ -27,6 +28,12 @@ renderer recomputes the availability semantics and 2025 eEML flag, while the sid
 NDA/BLA-before-dedup US and HSA observation shape so ANDA records and new-country rules cannot leak
 into the delivered 21-column output. Missing ATC or FDA Rare Drugs inputs abort the build rather than
 publishing an empty sidecar.
+
+Canonical substance ATC codes are resolved from WHO level-5 index names using exact normalized
+identity matches and the existing reviewed ATC-name aliases. No first-word, neighbouring-code,
+eEML-code, or national-register fallback is allowed. A substance with no clean index match therefore
+has no row in `substance_atc_codes` and an empty `atc_codes` value in CSV exports. Source-asserted raw
+and cleaned ATC values remain on `registered_products` and `product_ingredients` as provenance.
 
 ## Presence model
 
@@ -105,7 +112,9 @@ resolve redistribution rights inside the pipeline.
 
 `compare_atlas()` supports any number of selected tracked countries in its long and summary outputs.
 `current_qualified_countries` can explicitly apply a supported currentness filter to selected
-countries; the emitted `presence_basis` makes that choice visible.
+countries; the emitted `presence_basis` makes that choice visible. Long, summary, and wide views
+carry the same pipe-joined canonical `atc_codes` field, including the Bangladesh-Bhutan and
+Bhutan-current variants.
 Global penetration is:
 
 ```text
