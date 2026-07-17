@@ -12,3 +12,6 @@ data/**/views/*.csv
 data/output/*
 !data/output/fda_hsa_by_actives.csv
 !data/output/fda_hsa_combo_formulation_gaps.csv
+
+# local agent worktrees + skills scratch
+.claude/

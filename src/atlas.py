@@ -29,6 +29,7 @@ import pandas as pd
 
 from .atlas_adjudications import (
     CURATED_CONCEPT_KEYS,
+    CURATED_SUBSTANCE_ATC_CODES,
     adjudicate_eml_concept_product,
     aggregate_current_marketing,
     canonical_reviewed_identity,
@@ -2600,15 +2601,26 @@ def _build_substance_atc_codes(
     ].drop_duplicates(["atc_code", "canonical_substance_key"])
 
     candidate_rows: list[dict[str, str]] = []
+    curated_rows: list[dict[str, str]] = []
+    available_atc_codes = frozenset(atc_index["atc_code"].astype(str))
     for substance in substances.itertuples(index=False):
+        substance_id = str(substance.substance_id)
         substance_key = str(substance.normalized_ingredient_key)
+        curated_atc_codes = CURATED_SUBSTANCE_ATC_CODES.get(substance_key, ())
+        if curated_atc_codes:
+            curated_rows.extend(
+                {"substance_id": substance_id, "atc_code": atc_code}
+                for atc_code in curated_atc_codes
+                if atc_code in available_atc_codes
+            )
+            continue
         match_keys = [substance_key]
         if normalize_ingredient(substance_key) == substance_key:
             match_keys.extend(atc_match_names(substance_key))
         for match_key in dict.fromkeys(match_keys):
             candidate_rows.append(
                 {
-                    "substance_id": str(substance.substance_id),
+                    "substance_id": substance_id,
                     "canonical_substance_key": match_key,
                 }
             )
@@ -2618,7 +2630,9 @@ def _build_substance_atc_codes(
         on="canonical_substance_key",
         how="inner",
         sort=False,
-    )
+    )[columns]
+    if curated_rows:
+        matches = pd.concat([matches, pd.DataFrame(curated_rows)], ignore_index=True)
     return (
         matches[columns]
         .drop_duplicates()

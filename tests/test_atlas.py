@@ -1874,6 +1874,69 @@ class AtlasBuildTests(unittest.TestCase):
             all(codes == {expected} for codes in comparison_codes.values())
         )
 
+    def test_curated_vaccine_and_immunoglobulin_atc_codes_use_who_index(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_fixture_sources(root)
+
+            atc_path = root / "data" / "raw" / "who" / "atc.csv"
+            atc = pd.read_csv(atc_path, dtype=str).fillna("")
+            atc = pd.concat(
+                [
+                    atc,
+                    pd.DataFrame(
+                        [
+                            {"atc_code": "J07BD01", "atc_name": "measles, live attenuated"},
+                            {"atc_code": "J07AN01", "atc_name": "tuberculosis, live attenuated"},
+                            {"atc_code": "J06BB01", "atc_name": "anti-D (rh) immunoglobulin"},
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+            atc.to_csv(atc_path, index=False)
+
+            eeml_path = root / "data" / "raw" / "who" / "eeml_2025.csv"
+            eeml = pd.read_csv(eeml_path, dtype=str).fillna("")
+            eeml = pd.concat(
+                [
+                    eeml,
+                    pd.DataFrame(
+                        [
+                            {
+                                "Medicine name": name,
+                                "EML section": section,
+                                "Formulations": "vial",
+                                "Indication": "",
+                                "ATC codes": raw_atc,
+                                "Combined with": "",
+                                "Status": "Added",
+                            }
+                            for name, section, raw_atc in [
+                                ("measles vaccine", "Immunologicals > Vaccines", "J07BD01"),
+                                ("BCG vaccine", "Immunologicals > Vaccines", "L03AX03"),
+                                ("anti-D immunoglobulin", "Human immunoglobulins", "J06BB01"),
+                                ("hepatitis E vaccine", "Immunologicals > Vaccines", ""),
+                            ]
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+            eeml.to_csv(eeml_path, index=False)
+
+            artifact = build_atlas(BuildSpec(root=root, extraction_date=EXTRACTION_DATE))
+            substances = pd.read_csv(
+                artifact.table_paths["substances"], dtype=str
+            ).fillna("")
+
+        by_key = substances.set_index("normalized_ingredient_key")
+        self.assertEqual(by_key.loc["measles vaccine", "atc_codes"], "J07BD01")
+        self.assertEqual(by_key.loc["bcg vaccine", "atc_codes"], "J07AN01")
+        self.assertNotIn("L03AX03", by_key.loc["bcg vaccine", "atc_codes"])
+        self.assertEqual(by_key.loc["anti d immunoglobulin", "atc_codes"], "J06BB01")
+        self.assertEqual(by_key.loc["hepatitis e vaccine", "atc_codes"], "")
+
     def test_substance_without_exact_who_atc_match_stays_empty(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
